@@ -104,6 +104,13 @@ pub enum Error {
     /// wraps — this error is terminal for new-stream creation.
     StreamIdExhausted = 24,
 
+    /// The `next_stream_id` counter would overflow `u64` on increment. This is
+    /// the checked-increment guard for the stream counter: rather than silently
+    /// wrapping to 0 (which would reuse ids and corrupt lookups), the increment
+    /// fails with this typed error. Practically unreachable at 1.8e19 streams,
+    /// but enforced so wrapping can never occur.
+    StreamIdOverflow = 33,
+
     // --- Token sub-invocation ---
     /// The token contract rejected the transfer (e.g. insufficient balance in
     /// the pool on a payout, insufficient sender balance on a deposit, or the
