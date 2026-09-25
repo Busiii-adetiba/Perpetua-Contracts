@@ -33,6 +33,12 @@ pub enum Error {
     /// `deposited < duration`, so the per-second rate truncates to zero and the
     /// recipient would accrue nothing. See `MIN_RATE_STROOPS_PER_SECOND`.
     DepositRateTooLow = 5,
+    /// `deposited < (end_time - start_time)`, i.e. the deposit-to-duration
+    /// ratio is below the minimum of 1 stroop per second. The per-second rate
+    /// would truncate to zero under integer division, so the recipient would
+    /// accrue nothing until very late in the schedule. Deposit at least one
+    /// stroop per second of duration.
+    DepositTooSmall = 32,
     /// Sender and recipient are the same address.
     SelfStream = 6,
 
