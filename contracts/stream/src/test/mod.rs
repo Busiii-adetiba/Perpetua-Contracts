@@ -51,6 +51,7 @@ mod immutability;
 // Stage 3
 mod accrual_overflow;
 mod batch;
+// Issue #10: conservation invariant engine — vested(t) + refundable(t) == deposited.
 mod invariants;
 mod lifecycle_proptest;
 mod monotonicity;
