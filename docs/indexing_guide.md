@@ -56,6 +56,96 @@ filter. Use the Stellar SDK's `ScVal`/XDR encoder for topic filters and decoder
 for returned topics and values. The contract interface is the decoding source
 of truth; see [`contracts/stream/abi/fluxora_stream.json`](../contracts/stream/abi/fluxora_stream.json).
 
+## Event reconstruction rules
+
+This section is normative. An indexer that follows these rules will produce a
+byte-for-byte identical projection to any other conforming indexer, and to the
+on-chain state, for the same set of events. The rules are machine-checkable:
+[`script/event-byte-budget.py`](../script/event-byte-budget.py) encodes the
+canonical topic layout and payload field order in its `EVENT_SCHEMA` table and
+exposes `schema_fingerprint()` as a stable digest of that schema. Treat
+`EVENT_SCHEMA` and `schema_fingerprint()` as the source of truth; this document
+is a human-readable restatement of them.
+
+### Topic layout
+
+Every Perpetua event uses the same positional topic layout:
+
+1. `topic[0]` — the event name as a snake_case `symbol` (for example
+   `stream_created`). This is the discriminator an indexer switches on.
+2. `topic[1]` — `stream_id`, encoded as `u64`. Every event carries it, so a
+   stream-scoped projection can always be keyed by `(contract_id, stream_id)`.
+3. `topic[2..]` — the routing parties for the event, in the order listed in
+   the table above. These are `address` values. Events with no routing parties
+   (`ttl_extended`) stop at `topic[1]`; events with one or two parties append
+   them in the documented order.
+
+The number of topics is therefore `2 + len(routing_parties)` and is **not**
+constant across event types. Read the topic count from the event; never assume
+a fixed arity. The routing-party order is part of the schema: `cancelled`
+routes `(sender, recipient)` and `recipient_transferred` routes
+`(old_recipient, new_recipient)`, and swapping them is a schema violation even
+though the arity is identical.
+
+### Payload field order
+
+The event `data` payload is a struct whose fields are ordered exactly as
+declared in `EVENT_SCHEMA`. Field order is significant because the payload is
+serialized positionally; an indexer must decode fields by position, not by
+name, and must not reorder them. Per-event payload layouts:
+
+- `stream_created` — the complete initial stream state (sender, recipient,
+  token, amounts, schedule, and status). This is the bootstrap event; a
+  projection is built from it and then mutated by later events.
+- `withdrawn` — the withdrawn amount plus the cumulative accounting fields.
+- `cancelled` — the terminal accounting fields for the stream.
+- `paused`, `resumed`, `topped_up` — the fields describing the transition.
+- `recipient_transferred` — the old and new recipient.
+- `delegate_granted`, `delegate_revoked` — the grantor and delegate.
+- `ttl_extended` — the extension metadata.
+
+Decode amounts as `i128` token base units and keep them as integers or decimal
+strings; never pass them through an IEEE-754 `Number`.
+
+### Forward compatibility: tolerate unknown trailing fields
+
+Indexers **must tolerate unknown trailing fields** in the payload. A future
+contract version may append fields to an existing event's payload without
+changing its topic layout or its leading field order. A conforming decoder:
+
+- reads the fields it knows by position from the front of the payload,
+- ignores any additional trailing fields it does not recognize, and
+- does not fail, truncate, or reorder the event when extra fields are present.
+
+This keeps the topic layout and the leading payload prefix stable across
+contract upgrades, so an indexer built against an older `EVENT_SCHEMA` keeps
+working against a newer contract. Removing or reordering existing fields is a
+breaking change and requires a new event name; appending trailing fields is
+not.
+
+### Parity corpus and CI checks
+
+The golden JSON fixtures under
+[`tests/fixtures/event_snapshots/`](../tests/fixtures/event_snapshots/) are the
+parity corpus for these rules. Each fixture is a frozen, canonical
+serialization of an event (topics plus payload) that every implementation —
+Rust contract, TypeScript SDK, and GraphQL/SQL schema — must reproduce exactly.
+
+CI enforces parity with:
+
+- [`script/event-byte-budget.py`](../script/event-byte-budget.py) — the
+  `EVENT_SCHEMA` table and `schema_fingerprint()` that define the canonical
+  schema, plus the 16 KiB byte-footprint budget.
+- [`script/verify_event_bytes.py`](../script/verify_event_bytes.py) — verifies
+  each event's encoded footprint against the budget and the schema.
+- [`script/check_snapshot_diff.py`](../script/check_snapshot_diff.py) — diffs
+  freshly generated snapshots against the golden fixtures to detect schema
+  drift.
+
+A change to the topic layout or payload field order must update `EVENT_SCHEMA`,
+regenerate the golden fixtures, and pass all three scripts; otherwise CI fails
+with a schema-drift error.
+
 ## `getEvents` filter
 
 A request for Perpetua events uses the Soroban RPC `getEvents` method. The

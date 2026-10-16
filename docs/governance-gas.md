@@ -12,7 +12,59 @@ to regenerate the tables:
 python3 script/governance-gas-model.py
 ```
 
+`script/validate-doc-alignment.py` verifies this document against the model:
+it checks that the operation-count and event-byte tables above stay in lockstep
+with the values the model computes, and that the model's public docstrings
+match the terminology used here. It must pass with zero warnings.
+
+## Usage
+
+Run the profiler with no arguments to print the human-readable report
+(operation counts, the 10-signer round, and the event-byte tables):
+
+```bash
+python3 script/governance-gas-model.py
+```
+
+Pass `--json` to emit the same data as machine-readable JSON, suitable for
+piping into other tooling or for diffing against a checked-in baseline:
+
+```bash
+python3 script/governance-gas-model.py --json
+```
+
+Both modes exit `0` on success. The JSON output is the stable interface; the
+text report is for humans and may be reflowed.
+
+## Troubleshooting
+
+The profiler uses a small, fixed set of exit codes so it can be wired into CI:
+
+| exit code | meaning | what to do |
+|---:|---|---|
+| `0` | Success. The model parsed the contract source and all structural checks passed. | Nothing. |
+| `1` | A structural check failed — a per-vote cost guarantee from §3 regressed (e.g. `is_registered_signer` no longer reaches `SignerIndex`, or the quorum branch became unconditional). | Read the failing check's message; it names the helper and the expected call. Fix the contract, not the model. |
+| `2` | A `ParseError` was raised while reading the contract source. | See the `ParseError` cases below. |
+
+`ParseError` is raised when the model cannot locate a construct it depends on
+in `contracts/governance/src/lib.rs`. The cases are:
+
+* **Missing entrypoint.** One of `propose`, `approve` or `execute` was not
+  found, or its signature no longer matches the expected shape.
+* **Missing helper.** A free helper function the call graph resolves through
+  (for example `is_registered_signer` or `get_signer_index`) was renamed or
+  removed.
+* **Unbalanced braces.** The brace-matching used to locate the enclosing block
+  of the `QuorumReachedAt` write or the `proposal_queued` emit failed, which
+  usually means the source was edited into a shape the matcher does not
+  understand.
+
+A `ParseError` is not a bug in the contract — it means the model and the
+source have drifted apart. Update the model's expectations in the same change
+that moves the source.
+
 ## What this is, and what it is not
+=======
 
 Issue #54 asks for **measured CPU instruction counts**. This document does
 **not** contain them, and does not estimate them.

@@ -9,6 +9,8 @@ Checks:
 Exit 0 if all checks pass, exit 1 on mismatch.
 """
 
+import importlib.util
+import inspect
 import re
 import sys
 from pathlib import Path
@@ -17,6 +19,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Intentional non-ABI entries that are documented but not public entrypoints.
 AUDIT_ENTRYPOINT_ALLOWLIST = {"upgrade", "compute_keeper_fee_split"}
+
+# Scripts whose docstrings and markdown references must stay aligned.
+# Maps script path -> list of markdown files that must reference it and
+# document every public function defined in the script.
+SCRIPT_DOC_TARGETS = {
+    "script/governance-gas-model.py": ["docs/governance-gas.md"],
+    "script/event-byte-budget.py": ["docs/gas.md", "docs/ABI.md"],
+}
 
 
 def extract_contractimpl_pub_fns(source: str) -> list[str]:
@@ -154,6 +164,87 @@ def check_abi_constants() -> bool:
     return True  # Don't fail on warnings for now
 
 
+def load_script_module(script_path: Path):
+    """Import a standalone script by path and return the module object."""
+    spec = importlib.util.spec_from_file_location(script_path.stem, script_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def public_function_names(module) -> list[str]:
+    """Return sorted names of public functions defined in the module."""
+    names = []
+    for name, obj in vars(module).items():
+        if name.startswith("_"):
+            continue
+        if not inspect.isfunction(obj):
+            continue
+        # Only functions defined in this module, not imported ones.
+        if getattr(obj, "__module__", None) != module.__name__:
+            continue
+        names.append(name)
+    return sorted(set(names))
+
+
+def check_script_doc_alignment() -> bool:
+    """Check docstrings and markdown references for profiler scripts.
+
+    For each script in SCRIPT_DOC_TARGETS:
+      (a) the module must have a non-empty docstring,
+      (b) every public function name must appear in each referenced markdown
+          file, and
+      (c) each markdown file must reference the script path.
+
+    Returns False (failing CI) on any drift.
+    """
+    ok = True
+    for script_rel, doc_rels in SCRIPT_DOC_TARGETS.items():
+        script_path = REPO_ROOT / script_rel
+        if not script_path.exists():
+            print(f"FAIL: {script_rel} not found")
+            ok = False
+            continue
+
+        module = load_script_module(script_path)
+        if module is None:
+            print(f"FAIL: could not import {script_rel}")
+            ok = False
+            continue
+
+        docstring = inspect.getdoc(module) or ""
+        if not docstring.strip():
+            print(f"FAIL: {script_rel} has no module docstring")
+            ok = False
+
+        pub_fns = public_function_names(module)
+
+        for doc_rel in doc_rels:
+            doc_path = REPO_ROOT / doc_rel
+            if not doc_path.exists():
+                print(f"FAIL: {doc_rel} not found (referenced by {script_rel})")
+                ok = False
+                continue
+
+            doc = doc_path.read_text(encoding="utf-8")
+
+            if script_rel not in doc:
+                print(f"FAIL: {doc_rel} does not reference {script_rel}")
+                ok = False
+
+            missing = [fn for fn in pub_fns if fn not in doc]
+            if missing:
+                print(
+                    f"FAIL: {doc_rel} missing public function(s) from "
+                    f"{script_rel}: {missing}"
+                )
+                ok = False
+
+    return ok
+
+
 def check_error_alignment() -> bool:
     """Check that error.md discriminants match ContractError enum."""
     error_rs = REPO_ROOT / "contracts" / "stream" / "src" / "error.rs"
@@ -193,6 +284,10 @@ def main() -> int:
 
     print("Checking error.md discriminant alignment...")
     if not check_error_alignment():
+        passed = False
+
+    print("Checking script docstring/markdown alignment...")
+    if not check_script_doc_alignment():
         passed = False
 
     if passed:

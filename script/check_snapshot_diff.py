@@ -17,6 +17,75 @@ SECURITY_FIELDS = {
     "state", "DataKey",
 }
 
+# Frozen event-name set from docs/ABI.md (issue #286).
+FROZEN_EVENT_NAMES = {
+    "stream_created",
+    "withdrawn",
+    "cancelled",
+    "paused",
+    "resumed",
+    "topped_up",
+    "recipient_transferred",
+    "delegate_granted",
+    "delegate_revoked",
+    "ttl_extended",
+}
+
+# Required payload fields per frozen event name.
+REQUIRED_PAYLOAD_FIELDS = {
+    "stream_created": {"stream_id", "sender", "recipient", "amount"},
+    "withdrawn": {"stream_id", "recipient", "amount"},
+    "cancelled": {"stream_id", "sender", "recipient"},
+    "paused": {"stream_id"},
+    "resumed": {"stream_id"},
+    "topped_up": {"stream_id", "amount"},
+    "recipient_transferred": {"stream_id", "old_recipient", "new_recipient"},
+    "delegate_granted": {"stream_id", "delegate"},
+    "delegate_revoked": {"stream_id", "delegate"},
+    "ttl_extended": {"stream_id", "extended_to"},
+}
+
+EVENT_SNAPSHOT_DIR = REPO_ROOT / "tests" / "fixtures" / "event_snapshots"
+=======
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Security-relevant fields in snapshot JSON files
+SECURITY_FIELDS = {
+    "auth", "auths", "require_auth", "signatures", "events", "topic",
+    "topics", "data", "error", "error_code", "ContractError", "storage",
+    "state", "DataKey",
+}
+
+# Frozen event-name set from docs/ABI.md (issue #286).
+FROZEN_EVENT_NAMES = {
+    "stream_created",
+    "withdrawn",
+    "cancelled",
+    "paused",
+    "resumed",
+    "topped_up",
+    "recipient_transferred",
+    "delegate_granted",
+    "delegate_revoked",
+    "ttl_extended",
+}
+
+# Required payload fields per frozen event name.
+REQUIRED_PAYLOAD_FIELDS = {
+    "stream_created": {"stream_id", "sender", "recipient", "amount"},
+    "withdrawn": {"stream_id", "recipient", "amount"},
+    "cancelled": {"stream_id", "sender", "recipient"},
+    "paused": {"stream_id"},
+    "resumed": {"stream_id"},
+    "topped_up": {"stream_id", "amount"},
+    "recipient_transferred": {"stream_id", "old_recipient", "new_recipient"},
+    "delegate_granted": {"stream_id", "delegate"},
+    "delegate_revoked": {"stream_id", "delegate"},
+    "ttl_extended": {"stream_id", "extended_to"},
+}
+
+EVENT_SNAPSHOT_DIR = REPO_ROOT / "tests" / "fixtures" / "event_snapshots"
+
 
 def get_changed_files(base: str, head: str | None = None) -> list[str]:
     """Return changed snapshot JSON paths between two git refs."""
@@ -108,11 +177,102 @@ def check_snapshot_security_fields(snapshot_path: Path, base: str) -> list[str]:
     ]
 
 
+def _extract_topic_name(topic) -> str | None:
+    """Return the event name from a topic entry (string or list of segments)."""
+    if isinstance(topic, str):
+        return topic
+    if isinstance(topic, list):
+        for segment in topic:
+            if isinstance(segment, str) and segment in FROZEN_EVENT_NAMES:
+                return segment
+        for segment in topic:
+            if isinstance(segment, str):
+                return segment
+    return None
+
+
+def validate_event_snapshot(snapshot_path: Path) -> list[str]:
+    """Validate a single event snapshot fixture against the frozen ABI schema."""
+    try:
+        data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        return [f"{snapshot_path.name}: error: {error}"]
+
+    issues: list[str] = []
+    events = data.get("events") if isinstance(data, dict) else None
+    if not isinstance(events, list):
+        return [f"{snapshot_path.name}: missing 'events' array"]
+
+    for index, event in enumerate(events):
+        if not isinstance(event, dict):
+            issues.append(f"{snapshot_path.name}: events[{index}] is not an object")
+            continue
+
+        topic_name = _extract_topic_name(event.get("topic"))
+        if topic_name is None:
+            issues.append(f"{snapshot_path.name}: events[{index}] missing 'topic'")
+            continue
+        if topic_name not in FROZEN_EVENT_NAMES:
+            issues.append(
+                f"{snapshot_path.name}: events[{index}] unknown topic '{topic_name}'"
+            )
+            continue
+
+        payload = event.get("data", event.get("payload"))
+        if not isinstance(payload, dict):
+            issues.append(
+                f"{snapshot_path.name}: events[{index}] missing payload object"
+            )
+            continue
+
+        missing = REQUIRED_PAYLOAD_FIELDS[topic_name] - set(payload.keys())
+        for field in sorted(missing):
+            issues.append(
+                f"{snapshot_path.name}: events[{index}] ({topic_name}) "
+                f"missing required field '{field}'"
+            )
+
+    return issues
+
+
+def run_schema_check() -> int:
+    """Validate all event snapshot fixtures against the frozen ABI schema."""
+    if not EVENT_SNAPSHOT_DIR.is_dir():
+        print(f"No event snapshot directory at {EVENT_SNAPSHOT_DIR}.")
+        raise SystemExit(0)
+
+    fixtures = sorted(EVENT_SNAPSHOT_DIR.glob("*.json"))
+    if not fixtures:
+        print("No event snapshot fixtures found.")
+        raise SystemExit(0)
+
+    all_issues: list[str] = []
+    for fixture in fixtures:
+        all_issues.extend(validate_event_snapshot(fixture))
+
+    if all_issues:
+        print("Event snapshot schema violations:")
+        for issue in all_issues:
+            print(f"  - {issue}")
+        raise SystemExit(1)
+
+    print(f"Validated {len(fixtures)} event snapshot fixture(s) against frozen ABI.")
+    raise SystemExit(0)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check snapshot security diffs")
     parser.add_argument("--base", default="HEAD", help="Base ref to compare against")
     parser.add_argument("--head", default=None, help="Head ref to compare against")
+    parser.add_argument(
+        "--schema",
+        action="store_true",
+        help="Validate event snapshot fixtures against the frozen ABI schema",
+    )
     args = parser.parse_args()
+
+    if args.schema:
+        return run_schema_check()
 
     changed_files = get_changed_files(args.base, args.head)
     if not changed_files:

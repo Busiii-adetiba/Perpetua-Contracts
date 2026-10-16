@@ -70,7 +70,22 @@ jobs:
       - name: Validate doc alignment (streaming / events / errors)
         run: python3 script/validate-doc-alignment.py
 
+      # Hard gate (#286): verify that every Soroban event emitted by the
+      # contracts fits inside the 16 KiB per-event byte footprint and that
+      # the topic/data payload schemas match the frozen ABI.  A checker that
+      # only warns is not a check, so this is fatal by design.
+      - name: Event byte budget gate (16 KiB footprint)
+        if: ${{ hashFiles('script/verify_event_bytes.py') != '' }}
+        run: python3 script/verify_event_bytes.py
+
+      # Hard gate (#283): governance proposal vote/execute events must also
+      # stay within the 16 KiB footprint and match their documented schema.
+      - name: Governance event byte budget gate
+        if: ${{ hashFiles('script/verify_governance_event_bytes.py') != '' }}
+        run: python3 script/verify_governance_event_bytes.py
+
       # Hard gate: docs/ABI.md is the frozen interface of record. This
+=======
       # re-derives every #[contractevent] topic/payload layout from
       # events.rs and fails (exit 1) on any drift, plus checks that the
       # document still declares itself frozen. Unlike the step above, this
@@ -564,6 +579,21 @@ jobs:
       - name: Gas Regression Check
         if: ${{ hashFiles('script/validate_gas.py') != '' }}
         run: python3 script/validate_gas.py
+
+      # Hard gate (#286): golden event snapshot fixtures under
+      # tests/fixtures/event_snapshots/ must match the schemas produced by
+      # the contracts.  `--schema` compares topic/data layouts rather than
+      # raw bytes so cosmetic formatting changes do not trip the gate.
+      - name: Event snapshot schema diff gate
+        if: ${{ hashFiles('script/check_snapshot_diff.py', 'tests/fixtures/event_snapshots/**') != '' }}
+        run: python3 script/check_snapshot_diff.py --schema tests/fixtures/event_snapshots/
+
+      # Hard gate (#285): the committed WASM size budget must stay green.
+      # `check-stream-wasm-size.sh` reads the committed budget file and
+      # fails if any artifact exceeds its recorded upper bound.
+      - name: WASM size budget check
+        if: ${{ hashFiles('script/check-stream-wasm-size.sh') != '' }}
+        run: bash script/check-stream-wasm-size.sh
 
       # NOTE: --features cannot be combined with --workspace in Cargo 1.80+;
       # each contract is standalone, so the package is selected by directory.

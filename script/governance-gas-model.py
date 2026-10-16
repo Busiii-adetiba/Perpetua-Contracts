@@ -30,7 +30,23 @@ What it does:
      does not grow with the number of signers, and that the approval index is
      a Map lookup (O(1)) rather than a scan of the approvals Vec (O(n)).
 
-Exit codes: 0 = all checks pass, 1 = a check failed, 2 = could not run.
+Exit codes (the stable contract tests assert on):
+
+  0 = all checks pass
+  1 = a structural check failed (the report is still emitted)
+  2 = could not run (missing `GOV_LIB`, unparseable source, malformed input)
+
+`--json` emits a stable schema with four keys:
+
+  ``ok``        bool  - true when no structural problems were found
+  ``report``    dict  - per-entrypoint operation counts (empty on exit 2)
+  ``problems``  list  - human-readable structural problems (empty on pass)
+  ``exit_code`` int   - the process exit code, mirroring the contract above
+
+Error paths are explicit and testable: `ParseError` carries a stable message
+for a missing or unterminated function, `check_constant` reports malformed
+constants rather than raising, and `main` returns 2 (never raises) when
+`GOV_LIB` is absent.
 """
 
 from __future__ import annotations
@@ -40,6 +56,11 @@ import json
 import re
 import sys
 from pathlib import Path
+
+# Exit-code contract. Tests import these rather than hard-coding integers.
+EXIT_OK = 0
+EXIT_CHECK_FAILED = 1
+EXIT_COULD_NOT_RUN = 2
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GOV_LIB = REPO_ROOT / "contracts" / "governance" / "src" / "lib.rs"
@@ -415,13 +436,22 @@ def voting_round_event_bytes(signers: int = PROPOSAL_SIGS) -> dict[str, int]:
 
 
 def check_constant(source: str, name: str, expected: int) -> str | None:
-    """Confirm a contract constant still has the value the model assumes."""
+    """Confirm a contract constant still has the value the model assumes.
+
+    Returns a problem string (never raises) for a missing constant or one whose
+    literal is malformed - for example an empty or non-numeric value - so the
+    caller can report it as a check failure rather than crashing.
+    """
     m = re.search(
-        rf"\bconst\s+{re.escape(name)}\s*:\s*\w+\s*=\s*([\d_]+)\s*;", source
+        rf"\bconst\s+{re.escape(name)}\s*:\s*\w+\s*=\s*([^;]*);", source
     )
     if not m:
         return f"constant {name} not found in lib.rs"
-    actual = int(m.group(1).replace("_", ""))
+    raw = m.group(1).strip()
+    digits = raw.replace("_", "")
+    if not digits or not digits.isdigit():
+        return f"constant {name} has malformed value `{raw}`"
+    actual = int(digits)
     if actual != expected:
         return f"constant {name} is {actual}, model assumes {expected}"
     return None
@@ -583,19 +613,32 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not GOV_LIB.exists():
-        print(f"governance-gas-model: not found: {GOV_LIB}", file=sys.stderr)
-        return 2
+        message = f"governance-gas-model: not found: {GOV_LIB}"
+        if args.json:
+            print(json.dumps({"ok": False, "report": {}, "problems": [message],
+                              "exit_code": EXIT_COULD_NOT_RUN}, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return EXIT_COULD_NOT_RUN
 
     try:
         report, problems = run_checks()
     except ParseError as exc:
-        print(f"governance-gas-model: could not parse: {exc}", file=sys.stderr)
-        return 2
+        message = f"governance-gas-model: could not parse: {exc}"
+        if args.json:
+            print(json.dumps({"ok": False, "report": {}, "problems": [message],
+                              "exit_code": EXIT_COULD_NOT_RUN}, indent=2))
+        else:
+            print(message, file=sys.stderr)
+        return EXIT_COULD_NOT_RUN
+
+    exit_code = EXIT_CHECK_FAILED if problems else EXIT_OK
 
     if args.json:
         print(json.dumps({"ok": not problems, "report": report,
-                          "problems": problems}, indent=2))
-        return 1 if problems else 0
+                          "problems": problems, "exit_code": exit_code},
+                         indent=2))
+        return exit_code
 
     print("Governance operation counts (static; NOT instruction counts)")
     print("=" * 66)
@@ -624,14 +667,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(problems)} structural problem(s):")
         for p in problems:
             print(f"  - {p}")
-        return 1
+        return EXIT_CHECK_FAILED
 
     print()
     print("All structural checks passed.")
     print()
     print("These are operation counts derived from source, not measurements.")
     print("Instruction counts still require a host run; see the module docstring.")
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":

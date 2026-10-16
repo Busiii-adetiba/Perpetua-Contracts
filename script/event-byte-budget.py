@@ -41,10 +41,30 @@ target in issue #57. See docs/ABI.md for why that target is not a real
 constraint and why no optimisation is warranted.
 """
 
+# --- Deterministic error variants ---------------------------------------
+
+class ByteBudgetError(ValueError):
+    """Deterministic, code-carrying error for byte-budget violations.
+
+    Every rejection path raises this (never a bare ``assert``) so callers and
+    CI can branch on ``code`` without parsing messages.
+    """
+
+    def __init__(self, code, message):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
 # --- ScVal body sizes (discriminant included) ---------------------------
 
 
 def pad4(n):
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise ByteBudgetError(
+            "E_PAD4_TYPE", f"pad4 expects a non-negative int, got {type(n).__name__}")
+    if n < 0:
+        raise ByteBudgetError("E_PAD4_RANGE", f"pad4 expects n >= 0, got {n}")
     return n + ((4 - n % 4) % 4)
 
 
@@ -64,10 +84,23 @@ def boolean(_v):                # SCV_BOOL -> bool, padded to 4
     return 4 + 4
 
 
+_SYM_CACHE = {}
+
+
 def sym(name):                  # SCV_SYMBOL -> SCSymbol, a string<32>
+    cached = _SYM_CACHE.get(name)
+    if cached is not None:
+        return cached
+    if not isinstance(name, str):
+        raise ByteBudgetError(
+            "E_SYM_TYPE", f"symbol name must be str, got {type(name).__name__}")
     b = name.encode("utf-8")
-    assert len(b) <= 32, f"symbol exceeds SCSYMBOL_LIMIT=32: {name}"
-    return 4 + 4 + pad4(len(b))
+    if len(b) > 32:
+        raise ByteBudgetError(
+            "E_SYM_LIMIT", f"symbol exceeds SCSYMBOL_LIMIT=32: {name!r}")
+    size = 4 + 4 + pad4(len(b))
+    _SYM_CACHE[name] = size
+    return size
 
 
 def address(contract=False):    # SCV_ADDRESS -> SCAddress::Account(Hash[32])
@@ -81,11 +114,20 @@ def option_u64(_v):             # Option<u64> encodes as a Vec of 0 or 1 element
 
 
 def smap(pairs):                # SCV_MAP: disc(4) + ptr(4) + count(4) + entries
-    return 4 + 4 + 4 + sum(pad4(k) + pad4(v) for k, v in pairs)
+    total = 4 + 4 + 4
+    for k, v in pairs:
+        total += pad4(k) + pad4(v)
+    return total
 
 
 def topics(elements):           # SCVec = SCV_VEC: disc(4) + ptr(4) + count(4)
-    return 4 + 4 + 4 + sum(elements)
+    total = 4 + 4 + 4
+    for e in elements:
+        if isinstance(e, bool) or not isinstance(e, int) or e < 0:
+            raise ByteBudgetError(
+                "E_TOPIC_ELEM", f"topic element must be a non-negative int, got {e!r}")
+        total += e
+    return total
 
 
 # --- The events, as declared in contracts/stream/src/events.rs ----------
@@ -100,6 +142,8 @@ AMOUNT = 1_000_000_000_000   # 1e12, a large but ordinary token amount
 
 
 def _ev(name, topic_elems, pairs):
+    if not isinstance(name, str) or not name:
+        raise ByteBudgetError("E_EVENT_NAME", f"event name must be a non-empty str, got {name!r}")
     return {
         "name": name,
         "topics": topics(topic_elems),
@@ -178,15 +222,101 @@ FRAME = 4 + 40     # 44
 MAX_EVENT_BYTES = 16_384   # Protocol 27
 MAX_BATCH_SIZE = 16
 
+# --- Schema / indexer parity (#286) -------------------------------------
+
+SCHEMA_VERSION = 1
+
+# name -> {"topics": [field names], "payload": [field names]}
+EVENT_SCHEMA = {
+    "stream_created": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": ["token", "deposited", "start_time", "end_time",
+                    "cliff_time", "cancellable", "pausable", "transferable"],
+    },
+    "withdrawn": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["amount", "withdrawn", "deposited", "status"],
+    },
+    "cancelled": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": ["refunded", "vested", "withdrawn", "end_time"],
+    },
+    "paused": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["paused_at", "paused_total"],
+    },
+    "resumed": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["paused_duration", "paused_total"],
+    },
+    "topped_up": {
+        "topics": ["stream_id", "recipient"],
+        "payload": ["amount", "deposited", "end_time"],
+    },
+    "recipient_transferred": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": [],
+    },
+    "delegate_granted": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": ["ops", "expires_at"],
+    },
+    "delegate_revoked": {
+        "topics": ["stream_id", "sender", "recipient"],
+        "payload": [],
+    },
+    "ttl_extended": {
+        "topics": ["stream_id"],
+        "payload": ["extended_to_ledgers"],
+    },
+}
+
+
+def schema_fingerprint():
+    """Stable hash of the topic/payload layout, for ABI/indexer cross-checks."""
+    import hashlib
+    import json
+    canonical = json.dumps(
+        {"version": SCHEMA_VERSION, "events": EVENT_SCHEMA},
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_events():
+    if not EVENTS:
+        raise ByteBudgetError("E_NO_EVENTS", "EVENTS must not be empty")
+    seen = set()
+    for e in EVENTS:
+        name = e["name"]
+        if name in seen:
+            raise ByteBudgetError("E_DUP_EVENT", f"duplicate event name: {name}")
+        seen.add(name)
+        if name not in EVENT_SCHEMA:
+            raise ByteBudgetError("E_SCHEMA_MISSING", f"no schema entry for {name}")
+        for key in ("topics", "data"):
+            if isinstance(e[key], bool) or not isinstance(e[key], int) or e[key] < 0:
+                raise ByteBudgetError(
+                    "E_NEG_SIZE", f"{name}.{key} must be a non-negative int, got {e[key]!r}")
+    for name in EVENT_SCHEMA:
+        if name not in seen:
+            raise ByteBudgetError("E_SCHEMA_EXTRA", f"schema entry without event: {name}")
+
+
+_validate_events()
+
+# Pre-computed once at import time (#285): sizes() must not rebuild the table.
+_SIZES_CACHE = tuple(
+    {"name": e["name"],
+     "topics": e["topics"],
+     "data": e["data"],
+     "total": FRAME + e["topics"] + e["data"]}
+    for e in EVENTS
+)
+
 
 def sizes():
-    return [
-        {"name": e["name"],
-         "topics": e["topics"],
-         "data": e["data"],
-         "total": FRAME + e["topics"] + e["data"]}
-        for e in EVENTS
-    ]
+    return [dict(r) for r in _SIZES_CACHE]
 
 
 if __name__ == "__main__":
@@ -220,3 +350,5 @@ if __name__ == "__main__":
     )
     print(f"\nfull batch_withdraw + stream_created = {combined} bytes "
           f"({combined / MAX_EVENT_BYTES:.2%} of budget)")
+
+    print(f"\nschema v{SCHEMA_VERSION} fingerprint: {schema_fingerprint()}")

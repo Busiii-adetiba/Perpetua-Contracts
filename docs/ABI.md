@@ -324,6 +324,49 @@ Note that `batch_withdraw` emits one `withdrawn` event **per stream drawn
 from**, not one per call, and skips streams with nothing available — so a
 batch of 16 may emit fewer than 16 events.
 
+#### Enforced invariants
+
+`script/event-byte-budget.py` is the executable form of the table above, and it
+enforces the following invariants rather than assuming them:
+
+* Every encoded size is a multiple of 4, as XDR requires. A non-multiple is a
+  hard failure, not a rounding correction.
+* Every event's total is `topics + data`, and no event exceeds the 16,384-byte
+  transaction cap on its own.
+* Degenerate inputs are rejected **before** any size is committed or any event
+  is emitted. Zero-duration schedules (`end_time == start_time`), inverted
+  ranges (`end_time < start_time`), cliffs outside `[start_time, end_time]`,
+  and deposit rates at or above `i128::MAX` are all refused.
+* Same-ledger state transitions (a `withdraw`/`cancel`/`pause` observed at the
+  same ledger as the `stream_created` that produced the stream) are treated as
+  a distinct precondition, not as a zero-duration cliff.
+
+Rejections are deterministic and carry a stable `ByteBudgetError` code, so a
+caller can branch on the code rather than on a message string. No path wraps
+silently: an out-of-range intermediate is an error, never a truncated value.
+
+The module also exposes a stable `schema_fingerprint()` — a digest over the
+topic layout and payload field order of every event in the table above. It is
+the value downstream indexers pin; a change to it means the schema moved and
+the freeze rules apply.
+
+#### Schema parity
+
+`script/verify_event_bytes.py` and `script/check_snapshot_diff.py --schema`
+verify every event against **this document** and against the golden fixtures
+under [`tests/fixtures/event_snapshots/`](../tests/fixtures/event_snapshots/):
+
+* `verify_event_bytes.py` recomputes each event's byte footprint by hand from
+  the XDR definitions, without importing `event-byte-budget.py`, and fails if
+  the two disagree.
+* `check_snapshot_diff.py --schema` compares the topic layout and payload
+  schema of every event against the frozen golden JSON snapshots, and fails on
+  any drift — including a reordered topic or a renamed payload field.
+
+Together they cover every code path in `event-byte-budget.py`. The event
+reconstruction rules an indexer must follow are documented in
+[indexing_guide.md](indexing_guide.md).
+
 ---
 
 ## Resolved schema questions

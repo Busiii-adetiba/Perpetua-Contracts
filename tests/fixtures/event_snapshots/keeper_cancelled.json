@@ -4,10 +4,10 @@
     {
       "topic": "cancelled",
       "data": {
-        "keeper": "GKEEPER",
-        "keeper_fee": 500000,
-        "recipient_amount": 8000000,
-        "refunded": 1000000
+        "refunded": 1000000,
+        "vested": 8000000,
+        "withdrawn": 2000000,
+        "end_time": 1735689600
       }
     }
   ]
