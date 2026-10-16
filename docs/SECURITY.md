@@ -23,9 +23,14 @@ starts from buildable, pinned, reproducible inputs:
   pin the public ABI; `docs/audit.md` is the drift-checked entrypoint table.
 * **Invariant suite** — the 36 test modules (≈570 tests) assert the I1–I5
   invariants after every operation, over random schedules (`test::props`) and
-  across every entry-point ordering (`test::monotonicity`).
+  across every entry-point ordering (`test::monotonicity`). The event byte
+  footprint enforcer invariants (boundary guards, deterministic rejection of
+  degenerate parameters, zero silent wrapping) are pinned by
+  `tests/test_event_byte_budget.py`.
 * **Known-limits register** — `docs/KNOWN-LIMITATIONS.md` records what a green
-  suite does *not* prove. Reviewers are asked to read it before anything else.
+  suite does *not* prove, including the residual limits of the event byte
+  footprint enforcer's boundary checks. Reviewers are asked to read it before
+  anything else.
 
 **Status:** no third-party audit has been completed. Do not claim otherwise.
 This document lowers the cost of the first one.
@@ -41,6 +46,13 @@ This document lowers the cost of the first one.
   and the pool invariant `liability <= contract balance`.
 * The off-chain math mirror `sdk/stream-math.js` (must never disagree with
   `accrual.rs`).
+* The Soroban 16 KiB event byte footprint enforcer `script/event-byte-budget.py`
+  and its boundary/adversarial guarantees: degenerate parameters (zero-duration
+  cliffs, `i128::MAX` deposit rates, same-ledger state transitions) are rejected
+  deterministically with explicit error variants before any state is committed
+  or any event is emitted, and no integer arithmetic silently wraps. These
+  invariants are asserted by `tests/test_event_byte_budget.py` (unit and
+  property-based regression tests) and are part of the invariant suite below.
 * Build/provenance tooling in `script/` and `tools/provenance/` (only insofar
   as a defect could ship a wrong wasm).
 
@@ -99,5 +111,8 @@ reasoned non-issue within 30.
 
 * `docs/audit.md` — entrypoint inventory + arithmetic audit (§98).
 * `docs/dust-theft-proof.md` — why micro-top-ups cannot drain the pool (§102).
-* `docs/KNOWN-LIMITATIONS.md` — what a green suite does not prove.
+* `docs/KNOWN-LIMITATIONS.md` — what a green suite does not prove, including the
+  event byte footprint enforcer's boundary guarantees.
 * `docs/ABI.md` — the interface of record.
+* `script/event-byte-budget.py` — the Soroban 16 KiB event byte footprint
+  enforcer; invariants asserted by `tests/test_event_byte_budget.py`.

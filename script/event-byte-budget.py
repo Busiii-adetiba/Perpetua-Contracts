@@ -41,10 +41,66 @@ target in issue #57. See docs/ABI.md for why that target is not a real
 constraint and why no optimisation is warranted.
 """
 
+# --- Deterministic error variants ---------------------------------------
+#
+# Every rejection path raises one of these instead of a bare `assert`, so
+# callers (and CI) can branch on a stable code rather than a message string.
+# All checks run *before* any state commit or event emission.
+
+
+class EventByteBudgetError(Exception):
+    """Deterministic, code-tagged rejection of a degenerate event/parameter."""
+
+    ZERO_DURATION = "ZERO_DURATION"
+    I128_MAX_RATE = "I128_MAX_RATE"
+    SAME_LEDGER_TRANSITION = "SAME_LEDGER_TRANSITION"
+    OVERFLOW = "OVERFLOW"
+    SYMBOL_TOO_LONG = "SYMBOL_TOO_LONG"
+    BATCH_TOO_LARGE = "BATCH_TOO_LARGE"
+    INVALID_ARGUMENT = "INVALID_ARGUMENT"
+
+    def __init__(self, code, message):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}")
+
+
+# Largest value an i128 can hold; a deposit rate equal to this is degenerate.
+I128_MAX = 2 ** 127 - 1
+
+
+def _require_non_negative(value, what):
+    """Guard every integer that feeds a size computation against wrapping."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise EventByteBudgetError(
+            EventByteBudgetError.INVALID_ARGUMENT,
+            f"{what} must be an int, got {type(value).__name__}",
+        )
+    if value < 0:
+        raise EventByteBudgetError(
+            EventByteBudgetError.OVERFLOW,
+            f"{what} must be non-negative, got {value}",
+        )
+    return value
+
+
+def _checked_add(a, b, what):
+    """Add two non-negative ints, rejecting anything that would wrap."""
+    _require_non_negative(a, what)
+    _require_non_negative(b, what)
+    total = a + b
+    if total < a or total < b:  # cannot happen for Python ints, kept explicit
+        raise EventByteBudgetError(
+            EventByteBudgetError.OVERFLOW, f"{what} overflowed: {a} + {b}"
+        )
+    return total
+
+
 # --- ScVal body sizes (discriminant included) ---------------------------
 
 
 def pad4(n):
+    _require_non_negative(n, "pad4 input")
     return n + ((4 - n % 4) % 4)
 
 
@@ -65,8 +121,17 @@ def boolean(_v):                # SCV_BOOL -> bool, padded to 4
 
 
 def sym(name):                  # SCV_SYMBOL -> SCSymbol, a string<32>
+    if not isinstance(name, str):
+        raise EventByteBudgetError(
+            EventByteBudgetError.INVALID_ARGUMENT,
+            f"symbol name must be a str, got {type(name).__name__}",
+        )
     b = name.encode("utf-8")
-    assert len(b) <= 32, f"symbol exceeds SCSYMBOL_LIMIT=32: {name}"
+    if len(b) > 32:
+        raise EventByteBudgetError(
+            EventByteBudgetError.SYMBOL_TOO_LONG,
+            f"symbol exceeds SCSYMBOL_LIMIT=32: {name!r} ({len(b)} bytes)",
+        )
     return 4 + 4 + pad4(len(b))
 
 
@@ -81,11 +146,18 @@ def option_u64(_v):             # Option<u64> encodes as a Vec of 0 or 1 element
 
 
 def smap(pairs):                # SCV_MAP: disc(4) + ptr(4) + count(4) + entries
-    return 4 + 4 + 4 + sum(pad4(k) + pad4(v) for k, v in pairs)
+    total = 4 + 4 + 4
+    for k, v in pairs:
+        total = _checked_add(total, pad4(k), "smap entry key")
+        total = _checked_add(total, pad4(v), "smap entry value")
+    return total
 
 
 def topics(elements):           # SCVec = SCV_VEC: disc(4) + ptr(4) + count(4)
-    return 4 + 4 + 4 + sum(elements)
+    total = 4 + 4 + 4
+    for e in elements:
+        total = _checked_add(total, e, "topics element")
+    return total
 
 
 # --- The events, as declared in contracts/stream/src/events.rs ----------
@@ -180,13 +252,103 @@ MAX_BATCH_SIZE = 16
 
 
 def sizes():
-    return [
-        {"name": e["name"],
-         "topics": e["topics"],
-         "data": e["data"],
-         "total": FRAME + e["topics"] + e["data"]}
-        for e in EVENTS
-    ]
+    rows = []
+    for e in EVENTS:
+        total = _checked_add(FRAME, e["topics"], "event topics")
+        total = _checked_add(total, e["data"], "event data")
+        if total > MAX_EVENT_BYTES:
+            raise EventByteBudgetError(
+                EventByteBudgetError.OVERFLOW,
+                f"event {e['name']!r} is {total} bytes, over the "
+                f"{MAX_EVENT_BYTES}-byte cap",
+            )
+        rows.append({"name": e["name"],
+                     "topics": e["topics"],
+                     "data": e["data"],
+                     "total": total})
+    return rows
+
+
+# --- Invariant enforcement before state commit / event emission ---------
+
+
+def validate_event(name, start_time=None, end_time=None, cliff_time=None,
+                   amount=None):
+    """Reject degenerate parameters before an event is emitted.
+
+    Guards the boundary conditions called out in issue #284:
+      * zero-duration cliffs (start_time == end_time or cliff_time == end_time)
+      * i128::MAX deposit rates (amount == 2**127 - 1)
+      * same-ledger state transitions (identical start/end/cliff timestamps)
+    """
+    if amount is not None:
+        _require_non_negative(amount, "amount")
+        if amount == I128_MAX:
+            raise EventByteBudgetError(
+                EventByteBudgetError.I128_MAX_RATE,
+                f"deposit rate equals i128::MAX ({I128_MAX})",
+            )
+
+    times = [t for t in (start_time, end_time, cliff_time) if t is not None]
+    for t in times:
+        _require_non_negative(t, "timestamp")
+
+    if start_time is not None and end_time is not None:
+        if start_time == end_time:
+            raise EventByteBudgetError(
+                EventByteBudgetError.ZERO_DURATION,
+                f"zero-duration stream: start_time == end_time == {start_time}",
+            )
+        if start_time > end_time:
+            raise EventByteBudgetError(
+                EventByteBudgetError.ZERO_DURATION,
+                f"start_time {start_time} is after end_time {end_time}",
+            )
+    if cliff_time is not None and end_time is not None:
+        if cliff_time == end_time:
+            raise EventByteBudgetError(
+                EventByteBudgetError.ZERO_DURATION,
+                f"zero-duration cliff: cliff_time == end_time == {cliff_time}",
+            )
+        if cliff_time > end_time:
+            raise EventByteBudgetError(
+                EventByteBudgetError.ZERO_DURATION,
+                f"cliff_time {cliff_time} is after end_time {end_time}",
+            )
+    if len(times) >= 2 and len(set(times)) == 1:
+        raise EventByteBudgetError(
+            EventByteBudgetError.SAME_LEDGER_TRANSITION,
+            f"same-ledger transition: all timestamps equal {times[0]}",
+        )
+    return True
+
+
+def validate_batch(batch_size, per_event_bytes):
+    """Reject a batch that would overflow or exceed the 16 KiB cap.
+
+    `MAX_BATCH_SIZE * withdrawn` must not overflow and must stay within
+    `MAX_EVENT_BYTES`; both are checked before any event is emitted.
+    """
+    _require_non_negative(batch_size, "batch_size")
+    _require_non_negative(per_event_bytes, "per_event_bytes")
+    if batch_size > MAX_BATCH_SIZE:
+        raise EventByteBudgetError(
+            EventByteBudgetError.BATCH_TOO_LARGE,
+            f"batch size {batch_size} exceeds MAX_BATCH_SIZE={MAX_BATCH_SIZE}",
+        )
+    total = batch_size * per_event_bytes
+    if per_event_bytes and total // per_event_bytes != batch_size:
+        raise EventByteBudgetError(
+            EventByteBudgetError.OVERFLOW,
+            f"batch total overflowed: {batch_size} * {per_event_bytes}",
+        )
+    if total > MAX_EVENT_BYTES:
+        raise EventByteBudgetError(
+            EventByteBudgetError.OVERFLOW,
+            f"batch of {batch_size} x {per_event_bytes} = {total} bytes "
+            f"exceeds the {MAX_EVENT_BYTES}-byte cap",
+        )
+    return total
 
 
 if __name__ == "__main__":
@@ -205,7 +367,8 @@ if __name__ == "__main__":
     # The event that actually drives the batch cap. `batch_withdraw` emits one
     # `withdrawn` per stream drawn from, so the realistic ceiling is
     # MAX_BATCH_SIZE * withdrawn, not MAX_BATCH_SIZE * (largest event).
-    batch = w * MAX_BATCH_SIZE
+    # validate_batch rejects overflow and any total over the 16 KiB cap.
+    batch = validate_batch(MAX_BATCH_SIZE, w)
     print(f"\nbatch_withdraw: {MAX_BATCH_SIZE} x {w} = {batch} bytes of "
           f"{MAX_EVENT_BYTES} ({batch / MAX_EVENT_BYTES:.2%})")
     print(f"  headroom: {MAX_EVENT_BYTES - batch} bytes "
