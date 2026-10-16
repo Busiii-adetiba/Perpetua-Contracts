@@ -246,3 +246,172 @@ before interpreting stream IDs, addresses, statuses, or amounts.
 5. Treat an RPC provider's retention and rate limits as deployment concerns.
    For a durable historical index, archive raw pages or use a provider that
    guarantees access to the ledger range you need.
+
+## Deterministic event reconstruction rules
+
+This section is normative for any indexer that must produce byte-identical
+projections from the same ledger history. The frozen interface of record is
+[ABI.md](ABI.md); the golden fixtures under
+[`tests/fixtures/event_snapshots/`](../tests/fixtures/event_snapshots/) are the
+executable form of these rules. When this guide, the ABI, and the fixtures
+disagree, the fixtures and ABI win and this document must be corrected.
+
+### Topic layout
+
+Every Perpetua event has a fixed topic layout. `topic[0]` is always the event
+name encoded as a Soroban `symbol` in snake case. `topic[1]` is always the
+`stream_id` encoded as `u64`. Any remaining slots are the routing parties for
+that event, in the order listed below. Slots that are not listed are absent —
+they are not present-but-empty.
+
+| event | topic[0] | topic[1] | topic[2] | topic[3] | topic count |
+|---|---|---|---|---|---|
+| `stream_created` | `symbol("stream_created")` | `u64 stream_id` | `address sender` | `address recipient` | 4 |
+| `withdrawn` | `symbol("withdrawn")` | `u64 stream_id` | `address recipient` | — | 3 |
+| `cancelled` | `symbol("cancelled")` | `u64 stream_id` | `address sender` | `address recipient` | 4 |
+| `paused` | `symbol("paused")` | `u64 stream_id` | `address sender` | — | 3 |
+| `resumed` | `symbol("resumed")` | `u64 stream_id` | `address sender` | — | 3 |
+| `topped_up` | `symbol("topped_up")` | `u64 stream_id` | `address sender` | — | 3 |
+| `recipient_transferred` | `symbol("recipient_transferred")` | `u64 stream_id` | `address old_recipient` | `address new_recipient` | 4 |
+| `delegate_granted` | `symbol("delegate_granted")` | `u64 stream_id` | `address grantor` | `address delegate` | 4 |
+| `delegate_revoked` | `symbol("delegate_revoked")` | `u64 stream_id` | `address grantor` | `address delegate` | 4 |
+| `ttl_extended` | `symbol("ttl_extended")` | `u64 stream_id` | — | — | 2 |
+
+Rules that follow from the table:
+
+- Never assume a constant topic arity. Read `topics.length` per event and
+  dispatch on `topic[0]` first, then validate the arity for that event name.
+- An event whose `topic[0]` is not in the table is unknown. Persist it raw and
+  skip projection; do not guess a layout.
+- An event whose arity does not match the table is malformed. Fail the page,
+  do not advance the checkpoint, and surface the raw event for investigation.
+- Addresses are `ScVal` addresses, not strings. Decode them with the generated
+  SDK; never compare base64 topic bytes against hand-written literals.
+
+### Payload schema
+
+The data payload (`event.value`) is a single `ScVal` map. Field names are
+snake case and match the ABI. All amounts are `i128` token base units.
+
+| event | payload fields |
+|---|---|
+| `stream_created` | `stream_id`, `sender`, `recipient`, `deposit_amount`, `rate_per_ledger`, `start_ledger`, `cliff_ledger`, `end_ledger`, `withdrawable`, `status` |
+| `withdrawn` | `stream_id`, `recipient`, `amount`, `total_withdrawn`, `withdrawable`, `status` |
+| `cancelled` | `stream_id`, `sender`, `recipient`, `refund_amount`, `total_withdrawn`, `status` |
+| `paused` | `stream_id`, `sender`, `paused_at_ledger`, `accrued_at_pause`, `status` |
+| `resumed` | `stream_id`, `sender`, `resumed_at_ledger`, `accrued_at_resume`, `status` |
+| `topped_up` | `stream_id`, `sender`, `amount`, `deposit_amount`, `end_ledger`, `status` |
+| `recipient_transferred` | `stream_id`, `old_recipient`, `new_recipient`, `status` |
+| `delegate_granted` | `stream_id`, `grantor`, `delegate`, `permissions`, `status` |
+| `delegate_revoked` | `stream_id`, `grantor`, `delegate`, `status` |
+| `ttl_extended` | `stream_id`, `extended_to_ledger` |
+
+Payload rules:
+
+- Decode the map by field name, not by position. A future additive field must
+  not shift the meaning of an existing one.
+- `status` is the stream status after the state change, encoded as the ABI
+  enum. It is authoritative for the transition described by the event.
+- `withdrawable` is the amount claimable at the event's ledger, computed by the
+  contract. Do not recompute it from `rate_per_ledger` when the contract
+  supplies it; recomputation is only for reconciliation checks.
+- Amounts must be handled as integers or decimal strings. Never route an
+  `i128` through an IEEE-754 `Number`.
+
+### Ordering guarantees
+
+The contract emits exactly one event per state change, and events are ordered
+by the ledger that closed them:
+
+1. Ledgers are totally ordered by `ledger` (ascending).
+2. Within a ledger, transactions are ordered by `txIndex` (ascending).
+3. Within a transaction, events are ordered by `eventIndex` (ascending).
+
+The tuple `(ledger, txIndex, eventIndex)` is the canonical total order. Apply
+events in exactly that order. `(txHash, eventIndex)` is the deduplication key;
+`ledger` and `txIndex` are retained for audit and ordering. Because there is
+one event per state change, folding the ordered event stream reproduces the
+contract's state transitions without replaying storage writes.
+
+### Folding events into the `Stream` mirror
+
+Start from the `stream_created` event, which carries the complete initial
+state, then apply each subsequent event for that `stream_id` in canonical
+order. The mirror is a pure function of the ordered event stream.
+
+- `stream_created`: insert a new `Stream` row from the payload. Set
+  `deposit_amount`, `rate_per_ledger`, `start_ledger`, `cliff_ledger`,
+  `end_ledger`, `withdrawable`, and `status`. Record `sender` and `recipient`
+  from the payload and cross-check them against `topic[2]`/`topic[3]`.
+- `withdrawn`: add `amount` to `total_withdrawn`, set `withdrawable` to the
+  payload value, and set `status` from the payload. Do not recompute
+  `total_withdrawn` by summing `amount` across events unless reconciling; the
+  payload's cumulative field is authoritative.
+- `topped_up`: add `amount` to `deposit_amount`, adopt the payload's
+  `end_ledger`, and set `status`. A top-up can extend the stream, so
+  `end_ledger` must be overwritten, not max-merged blindly.
+- `paused`: set `status` to paused, store `paused_at_ledger`, and store
+  `accrued_at_pause`. Accrual stops at `paused_at_ledger`; the mirror must not
+  accrue withdrawable between `paused_at_ledger` and the resume ledger.
+- `resumed`: set `status` to active, store `resumed_at_ledger` and
+  `accrued_at_resume`, and shift the accrual window so that accrual restarts at
+  `resumed_at_ledger`. The elapsed paused interval is excluded from accrual;
+  `accrued_at_resume` is the contract's authoritative accrued amount at resume.
+- `cancelled`: set `status` to cancelled, record `refund_amount` and
+  `total_withdrawn` from the payload. A cancelled stream is terminal: no
+  further `withdrawn`, `paused`, `resumed`, or `topped_up` events may be
+  applied to it. If one arrives, treat it as a schema violation and halt.
+- `recipient_transferred`: replace `recipient` with `new_recipient`. The
+  `old_recipient` field and `topic[2]` must match the current mirror value;
+  a mismatch is a reconstruction error.
+- `delegate_granted` / `delegate_revoked`: upsert or delete the delegate
+  permission row keyed by `(stream_id, grantor, delegate)`. These events do not
+  change the `Stream` row itself.
+- `ttl_extended`: record `extended_to_ledger` for operational visibility. It
+  does not change stream accounting or status.
+
+Status transitions are therefore: created → active; active → paused → active;
+active → cancelled; active → completed when `withdrawable` reaches zero at or
+after `end_ledger`. Terminal states (`cancelled`, `completed`) never transition
+again.
+
+### Decoding with the generated SDK
+
+Decode topics and payloads with the SDK generated from
+[`contracts/stream/abi/fluxora_stream.json`](../contracts/stream/abi/fluxora_stream.json),
+not with hand-rolled XDR parsing:
+
+```js
+import { scValToNative, xdr } from "@stellar/stellar-sdk";
+
+function decodeEvent(event) {
+  const topics = event.topic.map((t) =>
+    scValToNative(xdr.ScVal.fromXDR(t, "base64")),
+  );
+  const value = scValToNative(xdr.ScVal.fromXDR(event.value, "base64"));
+  return { name: topics[0], streamId: topics[1], parties: topics.slice(2), value };
+}
+```
+
+The generated client exposes the same decoders used by the contract tests, so
+the SDK, the Rust contracts, and the GraphQL/SQL projections stay in lockstep.
+Any change to a topic position or payload field is a breaking ABI change and
+must be accompanied by updated fixtures.
+
+### Validating parity with the snapshot fixtures
+
+The fixtures under
+[`tests/fixtures/event_snapshots/`](../tests/fixtures/event_snapshots/) are
+golden JSON snapshots of decoded events and the resulting `Stream` mirror.
+Indexers should run the same checks in CI:
+
+- `script/verify_event_bytes.py` asserts that each fixture's encoded event
+  stays within the 16 KiB Soroban event byte budget and that the topic/payload
+  layout matches the ABI.
+- `script/check_snapshot_diff.py` re-folds the fixture event stream and diffs
+  the resulting `Stream` mirror against the golden snapshot, failing on any
+  drift.
+
+A projection is in parity only when both scripts pass. Treat a snapshot diff
+as a schema change: update the ABI, the fixtures, and this guide together, and
+never regenerate a fixture to hide an unexplained diff.

@@ -292,6 +292,37 @@
   ],
   "events": [
     {
+      "name": "StreamCreated",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "sender", "type": "Address"},
+        {"name": "recipient", "type": "Address"}
+      ],
+      "data": [
+        {"name": "token", "type": "Address"},
+        {"name": "deposited", "type": "i128"},
+        {"name": "start_time", "type": "u64"},
+        {"name": "end_time", "type": "u64"},
+        {"name": "cliff_time", "type": "u64"},
+        {"name": "cancellable", "type": "bool"},
+        {"name": "pausable", "type": "bool"},
+        {"name": "transferable", "type": "bool"}
+      ]
+    },
+    {
+      "name": "Withdrawn",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "recipient", "type": "Address"}
+      ],
+      "data": [
+        {"name": "amount", "type": "i128"},
+        {"name": "withdrawn", "type": "i128"},
+        {"name": "deposited", "type": "i128"},
+        {"name": "status", "type": "StreamStatus"}
+      ]
+    },
+    {
       "name": "Cancelled",
       "topics": [
         {"name": "stream_id", "type": "u64"},
@@ -317,16 +348,6 @@
       ]
     },
     {
-      "name": "RecipientTransferred",
-      "topics": [
-        {"name": "stream_id", "type": "u64"},
-        {"name": "old_recipient", "type": "Address"},
-        {"name": "new_recipient", "type": "Address"}
-      ],
-      "data": [
-      ]
-    },
-    {
       "name": "Resumed",
       "topics": [
         {"name": "stream_id", "type": "u64"},
@@ -335,24 +356,6 @@
       "data": [
         {"name": "paused_duration", "type": "u64"},
         {"name": "paused_total", "type": "u64"}
-      ]
-    },
-    {
-      "name": "StreamCreated",
-      "topics": [
-        {"name": "stream_id", "type": "u64"},
-        {"name": "sender", "type": "Address"},
-        {"name": "recipient", "type": "Address"}
-      ],
-      "data": [
-        {"name": "token", "type": "Address"},
-        {"name": "deposited", "type": "i128"},
-        {"name": "start_time", "type": "u64"},
-        {"name": "end_time", "type": "u64"},
-        {"name": "cliff_time", "type": "u64"},
-        {"name": "cancellable", "type": "bool"},
-        {"name": "pausable", "type": "bool"},
-        {"name": "transferable", "type": "bool"}
       ]
     },
     {
@@ -368,6 +371,16 @@
       ]
     },
     {
+      "name": "RecipientTransferred",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "old_recipient", "type": "Address"},
+        {"name": "new_recipient", "type": "Address"}
+      ],
+      "data": [
+      ]
+    },
+    {
       "name": "TtlExtended",
       "topics": [
         {"name": "stream_id", "type": "u64"}
@@ -377,16 +390,25 @@
       ]
     },
     {
-      "name": "Withdrawn",
+      "name": "DelegateGranted",
       "topics": [
         {"name": "stream_id", "type": "u64"},
-        {"name": "recipient", "type": "Address"}
+        {"name": "grantor", "type": "Address"},
+        {"name": "delegate", "type": "Address"}
       ],
       "data": [
-        {"name": "amount", "type": "i128"},
-        {"name": "withdrawn", "type": "i128"},
-        {"name": "deposited", "type": "i128"},
-        {"name": "status", "type": "StreamStatus"}
+        {"name": "ops", "type": "u32"},
+        {"name": "expires_at", "type": "Option<u64>"}
+      ]
+    },
+    {
+      "name": "DelegateRevoked",
+      "topics": [
+        {"name": "stream_id", "type": "u64"},
+        {"name": "grantor", "type": "Address"},
+        {"name": "delegate", "type": "Address"}
+      ],
+      "data": [
       ]
     }
   ]

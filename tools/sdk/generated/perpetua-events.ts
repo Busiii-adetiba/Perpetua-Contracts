@@ -110,6 +110,31 @@ export interface WithdrawnEvent {
   };
 }
 
+export interface DelegateGrantedEvent {
+  name: "DelegateGranted";
+  topics: {
+    stream_id: bigint | number;
+    delegator: string;
+    delegatee: string;
+  };
+  data: {
+    permissions: unknown;
+    expires_at: bigint | number;
+  };
+}
+
+export interface DelegateRevokedEvent {
+  name: "DelegateRevoked";
+  topics: {
+    stream_id: bigint | number;
+    delegator: string;
+    delegatee: string;
+  };
+  data: {
+    [key: string]: unknown;
+  };
+}
+
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "../../..");
@@ -344,6 +369,51 @@ const EVENT_SPECS = [
         "type": "StreamStatus"
       }
     ]
+  },
+  {
+    "name": "DelegateGranted",
+    "topics": [
+      {
+        "name": "stream_id",
+        "type": "u64"
+      },
+      {
+        "name": "delegator",
+        "type": "Address"
+      },
+      {
+        "name": "delegatee",
+        "type": "Address"
+      }
+    ],
+    "data": [
+      {
+        "name": "permissions",
+        "type": "DelegatePermissions"
+      },
+      {
+        "name": "expires_at",
+        "type": "u64"
+      }
+    ]
+  },
+  {
+    "name": "DelegateRevoked",
+    "topics": [
+      {
+        "name": "stream_id",
+        "type": "u64"
+      },
+      {
+        "name": "delegator",
+        "type": "Address"
+      },
+      {
+        "name": "delegatee",
+        "type": "Address"
+      }
+    ],
+    "data": []
   }
 ] as const;
 const EVENT_NAMES = EVENT_SPECS.map((event) => event.name);
@@ -594,7 +664,49 @@ export function decodeWithdrawnEvent(event: { name?: string; topics?: RpcTopicVa
   } as WithdrawnEvent;
 }
 
+export function decodeDelegateGrantedEvent(event: { name?: string; topics?: RpcTopicValue[]; data?: RpcEventValue; value?: RpcEventValue } | undefined): DelegateGrantedEvent | undefined {
+  if (!event) {
+    return undefined;
+  }
 
-export type PerpetuaEvent = CancelledEvent | PausedEvent | RecipientTransferredEvent | ResumedEvent | StreamCreatedEvent | ToppedUpEvent | TtlExtendedEvent | WithdrawnEvent;
+  const eventName = event.name ?? "DelegateGranted";
+  const topics = event.topics ?? [];
+  const value = event.data ?? event.value ?? {};
+  const decoded = decodeFromAbi(eventName, topics, value);
+
+  if (!decoded || decoded.name !== "DelegateGranted") {
+    return undefined;
+  }
+
+  return {
+    name: "DelegateGranted",
+    topics: Object.fromEntries([{"name":"stream_id","type":"u64"},{"name":"delegator","type":"Address"},{"name":"delegatee","type":"Address"}].map((field, index) => [field.name, topics[index] ?? undefined])),
+    data: Object.fromEntries([{"name":"permissions","type":"DelegatePermissions"},{"name":"expires_at","type":"u64"}].map((field) => [field.name, (typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>)[field.name] : undefined) ?? undefined]).filter(([, val]) => val !== undefined)),
+  } as DelegateGrantedEvent;
+}
+
+export function decodeDelegateRevokedEvent(event: { name?: string; topics?: RpcTopicValue[]; data?: RpcEventValue; value?: RpcEventValue } | undefined): DelegateRevokedEvent | undefined {
+  if (!event) {
+    return undefined;
+  }
+
+  const eventName = event.name ?? "DelegateRevoked";
+  const topics = event.topics ?? [];
+  const value = event.data ?? event.value ?? {};
+  const decoded = decodeFromAbi(eventName, topics, value);
+
+  if (!decoded || decoded.name !== "DelegateRevoked") {
+    return undefined;
+  }
+
+  return {
+    name: "DelegateRevoked",
+    topics: Object.fromEntries([{"name":"stream_id","type":"u64"},{"name":"delegator","type":"Address"},{"name":"delegatee","type":"Address"}].map((field, index) => [field.name, topics[index] ?? undefined])),
+    data: Object.fromEntries([].map((field) => [field.name, (typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>)[field.name] : undefined) ?? undefined]).filter(([, val]) => val !== undefined)),
+  } as DelegateRevokedEvent;
+}
+
+
+export type PerpetuaEvent = CancelledEvent | PausedEvent | RecipientTransferredEvent | ResumedEvent | StreamCreatedEvent | ToppedUpEvent | TtlExtendedEvent | WithdrawnEvent | DelegateGrantedEvent | DelegateRevokedEvent;
 
 export const PERPETUA_EVENT_NAMES = EVENT_NAMES;

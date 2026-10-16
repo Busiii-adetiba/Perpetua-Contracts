@@ -15,7 +15,22 @@ SECURITY_FIELDS = {
     "auth", "auths", "require_auth", "signatures", "events", "topic",
     "topics", "data", "error", "error_code", "ContractError", "storage",
     "state", "DataKey",
+    # Event payload / topic field names frozen in docs/ABI.md
+    "refunded", "vested", "paused_at", "paused_total", "paused_duration",
+    "extended_to_ledgers", "ops", "expires_at", "old_recipient",
+    "new_recipient", "grantor", "delegate",
 }
+
+# Directories containing snapshot JSON fixtures that must be diffed in CI
+SNAPSHOT_DIRS = ("test_snapshots", "tests/fixtures/event_snapshots")
+
+
+def is_snapshot_path(path: str) -> bool:
+    """Return whether a path is a snapshot JSON fixture we track."""
+    if not path.endswith(".json"):
+        return False
+    normalized = path.replace("\\", "/")
+    return any(directory in normalized for directory in SNAPSHOT_DIRS)
 
 
 def get_changed_files(base: str, head: str | None = None) -> list[str]:
@@ -31,7 +46,7 @@ def get_changed_files(base: str, head: str | None = None) -> list[str]:
 
     return [
         path for path in output.decode("utf-8").splitlines()
-        if path.endswith(".json") and "test_snapshots" in path
+        if is_snapshot_path(path)
     ]
 
 
@@ -77,6 +92,12 @@ def get_diff_paths(old, new, prefix: str = "") -> list[str]:
             paths.extend(get_diff_paths(old_item, new_item, child))
         return paths
 
+    if isinstance(old, dict) != isinstance(new, dict):
+        return [prefix]
+
+    if isinstance(old, list) != isinstance(new, list):
+        return [prefix]
+
     return [] if old == new else [prefix]
 
 
@@ -93,8 +114,12 @@ def check_snapshot_security_fields(snapshot_path: Path, base: str) -> list[str]:
     except ValueError:
         return [f"{snapshot_path.name}: path is not under repository root"]
 
+    try:
+        new_content = snapshot_path.read_text(encoding="utf-8")
+    except OSError as error:
+        return [f"{snapshot_path.name}: error: {error}"]
+
     old_content = get_file_content(base, str(relative_path))
-    new_content = snapshot_path.read_text(encoding="utf-8")
     try:
         old_data = json.loads(old_content) if old_content is not None else {}
         new_data = json.loads(new_content)
@@ -123,18 +148,28 @@ def main() -> int:
     for path in changed_files:
         old_content = get_file_content(args.base, path)
         new_content = get_file_content(args.head, path)
+
+        parse_errors = []
         try:
             old_data = json.loads(old_content) if old_content is not None else {}
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError) as error:
             old_data = {}
+            parse_errors.append(f"base: {error}")
         try:
             new_data = json.loads(new_content) if new_content is not None else {}
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError) as error:
             new_data = {}
+            parse_errors.append(f"head: {error}")
+
+        if parse_errors:
+            for error in parse_errors:
+                print(f"[ERROR] {path}: malformed JSON ({error})")
+            all_issues.append(f"{path}: malformed JSON")
+            continue
 
         security_paths = [
-            path for path in get_diff_paths(old_data, new_data)
-            if is_security_relevant(path)
+            diff_path for diff_path in get_diff_paths(old_data, new_data)
+            if is_security_relevant(diff_path)
         ]
         if not security_paths:
             print(f"[INFO] Changes in {path}: none are security-relevant")

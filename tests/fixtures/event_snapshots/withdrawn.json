@@ -1,0 +1,58 @@
+{
+  "event": "withdrawn",
+  "contract": "fluxora_stream",
+  "abi_version": "1.0.0",
+  "description": "Emitted when a recipient withdraws accrued stream funds. Topics carry the event name and indexed stream id; data carries the withdrawn amount and remaining balance.",
+  "topics": [
+    {
+      "name": "event",
+      "type": "symbol",
+      "value": "withdrawn",
+      "indexed": true
+    },
+    {
+      "name": "stream_id",
+      "type": "u64",
+      "value": 42,
+      "indexed": true
+    }
+  ],
+  "data": {
+    "amount": 1500000000,
+    "remaining_balance": 3500000000
+  },
+  "data_schema": {
+    "type": "struct",
+    "name": "WithdrawnData",
+    "fields": [
+      {
+        "name": "amount",
+        "type": "i128"
+      },
+      {
+        "name": "remaining_balance",
+        "type": "i128"
+      }
+    ]
+  },
+  "topic_layout": [
+    "symbol:withdrawn",
+    "u64:stream_id"
+  ],
+  "payload_schema": [
+    "i128:amount",
+    "i128:remaining_balance"
+  ],
+  "byte_budget": {
+    "topic_bytes": 41,
+    "data_bytes": 64,
+    "total_bytes": 105,
+    "limit_bytes": 16384,
+    "within_budget": true
+  },
+  "ledger": {
+    "sequence": 1234567,
+    "timestamp": 1700000000,
+    "tx_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

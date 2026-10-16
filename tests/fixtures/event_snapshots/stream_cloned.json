@@ -3,10 +3,21 @@
   "stream_id": 7,
   "events": [
     {
-      "topic": "stream_cloned",
+      "topic": "stream_created",
+      "topics": [
+        "stream_id",
+        "sender",
+        "recipient"
+      ],
       "data": {
-        "recipient": "GRECIPlENT",
-        "deposit_amount": 10000000
+        "token": "GTOKEN",
+        "deposited": 10000000,
+        "start_time": 1700000000,
+        "end_time": 1700086400,
+        "cliff_time": 1700003600,
+        "cancellable": true,
+        "pausable": false,
+        "transferable": true
       }
     }
   ]

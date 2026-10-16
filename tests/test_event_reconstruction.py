@@ -13,6 +13,51 @@ from dataclasses import dataclass, field
 import random
 from typing import Any
 
+# Frozen ABI payload schemas (docs/ABI.md). Every emitted event must carry
+# exactly these keys, and the indexer must consume exactly these keys.
+ABI_EVENT_SCHEMAS: dict[str, frozenset[str]] = {
+    "stream_created": frozenset(
+        {
+            "sender",
+            "recipient",
+            "token",
+            "deposited",
+            "start_time",
+            "end_time",
+            "cliff_time",
+            "cancellable",
+            "pausable",
+            "transferable",
+        }
+    ),
+    "paused": frozenset({"sender", "paused_at", "paused_total"}),
+    "resumed": frozenset({"sender", "paused_duration", "paused_total"}),
+    "topped_up": frozenset({"sender", "amount", "deposited", "end_time"}),
+    "withdrawn": frozenset({"recipient", "amount", "withdrawn", "deposited", "status"}),
+    "cancelled": frozenset(
+        {"sender", "recipient", "refunded", "vested", "withdrawn", "end_time"}
+    ),
+    "recipient_transferred": frozenset({"old_recipient", "new_recipient"}),
+    "ttl_extended": frozenset({"extended_to_ledgers"}),
+}
+
+# GraphQL/SQL mirror columns for the `streams` projection. The indexer's
+# reconstructed StreamState must expose exactly these fields.
+GRAPHQL_STREAM_COLUMNS: tuple[str, ...] = (
+    "sender",
+    "recipient",
+    "token",
+    "deposited",
+    "withdrawn",
+    "start_time",
+    "end_time",
+    "cliff_time",
+    "flags",
+    "paused_at",
+    "paused_total",
+    "status",
+)
+
 
 @dataclass
 class StreamState:
@@ -49,6 +94,10 @@ class StorageModel:
         return deepcopy(self.streams[stream_id])
 
     def _emit(self, kind: str, stream_id: int, data: dict[str, Any]) -> Event:
+        # Enforce the frozen ABI schema at emission time so the model can never
+        # drift from docs/ABI.md or the golden snapshot fixtures.
+        expected = ABI_EVENT_SCHEMAS[kind]
+        assert set(data) == expected, (kind, set(data) ^ expected)
         event = Event(kind, stream_id, data, self.now)
         self.events.append(event)
         return event
@@ -203,6 +252,11 @@ class EventIndexer:
 
     def consume(self, event: Event) -> None:
         data = event.data
+        # The indexer must consume exactly the frozen ABI payload shape.
+        expected = ABI_EVENT_SCHEMAS.get(event.kind)
+        if expected is not None:
+            assert set(data) == expected, (event.kind, set(data) ^ expected)
+
         if event.kind == "stream_created":
             self.streams[event.stream_id] = StreamState(
                 sender=data["sender"],
@@ -234,6 +288,8 @@ class EventIndexer:
         elif event.kind == "cancelled":
             stream.sender = data["sender"]
             stream.recipient = data["recipient"]
+            # `vested` is the post-cancel deposited balance; `refunded` is the
+            # amount returned to the sender and is not part of stored state.
             stream.deposited = data["vested"]
             stream.withdrawn = data["withdrawn"]
             stream.end_time = data["end_time"]
@@ -262,6 +318,27 @@ def _assert_equal(storage: StorageModel, indexer: EventIndexer) -> None:
     assert set(storage.streams) == set(indexer.streams)
     for stream_id in storage.streams:
         assert indexer.streams[stream_id] == storage.get_stream(stream_id), stream_id
+
+
+def _assert_graphql_mirror(indexer: EventIndexer) -> None:
+    """The reconstructed Stream must expose exactly the GraphQL/SQL columns."""
+    for stream in indexer.streams.values():
+        row = {
+            "sender": stream.sender,
+            "recipient": stream.recipient,
+            "token": stream.token,
+            "deposited": stream.deposited,
+            "withdrawn": stream.withdrawn,
+            "start_time": stream.start_time,
+            "end_time": stream.end_time,
+            "cliff_time": stream.cliff_time,
+            "flags": stream.flags,
+            "paused_at": stream.paused_at,
+            "paused_total": stream.paused_total,
+            "status": stream.status,
+        }
+        assert tuple(row) == GRAPHQL_STREAM_COLUMNS
+        assert set(row) == set(GRAPHQL_STREAM_COLUMNS)
 
 
 def test_random_event_reconstruction_matches_get_stream() -> None:
@@ -318,6 +395,28 @@ def test_random_event_reconstruction_matches_get_stream() -> None:
 
         indexer.consume(event)
         _assert_equal(storage, indexer)
+        _assert_graphql_mirror(indexer)
 
     assert len(storage.events) == 100
     _assert_equal(storage, indexer)
+    _assert_graphql_mirror(indexer)
+
+
+def test_event_payloads_match_frozen_abi_schemas() -> None:
+    """Every emitted event carries exactly the frozen ABI payload keys."""
+    rng = random.Random(0xAB1)
+    storage = StorageModel(rng=rng)
+    storage.create(0, "G0", "R0", "TOKEN")
+    storage.pause(0)
+    storage.resume(0)
+    storage.top_up(0, 1_000)
+    storage.withdraw(0, 1)
+    storage.transfer(0, "R1")
+    storage.ttl_extended(0)
+    storage.create(1, "G1", "R1", "TOKEN")
+    storage.cancel(1)
+
+    seen = {event.kind for event in storage.events}
+    assert seen == set(ABI_EVENT_SCHEMAS)
+    for event in storage.events:
+        assert set(event.data) == ABI_EVENT_SCHEMAS[event.kind]

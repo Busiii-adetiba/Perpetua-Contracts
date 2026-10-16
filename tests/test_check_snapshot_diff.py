@@ -599,22 +599,128 @@ class TestMainGuard:
             )
         mock_main.assert_not_called()
 
+    def test_main_guard_fires_via_runpy_as_main(self):
+        """
+        Covers line 123 directly: running the module with ``run_name='__main__'``
+        must invoke ``main()``.  ``main`` is patched so the guard's call is
+        observable without performing any git work.
+        """
+        with patch.object(check_snapshot_diff, 'main') as mock_main:
+            runpy.run_path(
+                os.path.join(
+                    os.path.dirname(__file__), '..', 'script', 'check_snapshot_diff.py'
+                ),
+                run_name='__main__',
+            )
+        mock_main.assert_called_once_with()
+
+    def test_script_runs_clean_against_golden_fixture_repo(self, tmp_path):
+        """
+        End-to-end guard check: invoke the script as CI does against a real
+        repository whose only snapshot change is a golden fixture mutation.
+        """
+        repo = str(tmp_path)
+        _run_git(['init', '-q'], cwd=repo)
+
+        rel_path = 'contracts/stream/test_snapshots/stream_created.json'
+        baseline = _load_fixture('stream_created.json')
+        base_sha = _commit_snapshot(repo, rel_path, baseline)
+
+        mutated = copy.deepcopy(baseline)
+        mutated['events'][0]['data']['deposit_amount'] = 12345678
+        head_sha = _commit_snapshot(repo, rel_path, mutated)
+
+        script_path = os.path.join(
+            os.path.dirname(__file__), '..', 'script', 'check_snapshot_diff.py'
+        )
+        result = subprocess.run(
+            [sys.executable, script_path, '--base', base_sha, '--head', head_sha],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+        )
+        assert 'Traceback' not in result.stderr, result.stderr
+        assert result.returncode == 1
+        assert 'Security-relevant fields changed' in result.stdout
+
 
 # ===========================================================================
-# Real event fixtures — KeeperCancelled / StreamCloned
+# Real event fixtures — ABI-aligned event snapshot corpus
 # ===========================================================================
 #
-# These fixtures model the actual payload shapes emitted by
-# ``contracts/stream/src/events.rs::emit_keeper_cancelled`` /
-# ``emit_stream_cloned``, whose field names come from the ``KeeperCancelled``
-# and ``StreamCloned`` structs in ``contracts/stream/src/types.rs``. No
-# committed ``contracts/stream/test_snapshots/*.json`` corpus exists yet in
-# this repository (the on-chain snapshot-writing harness is a separate,
-# not-yet-landed piece of work), so the fixtures below are modeled directly
-# on those struct definitions rather than copied byte-for-byte from disk.
+# These fixtures model the actual payload shapes emitted by the stream
+# contract's event emitters (``contracts/stream/src/events.rs``), whose field
+# names come from the event structs in ``contracts/stream/src/types.rs`` and
+# are frozen in ``docs/ABI.md``. The corpus under
+# ``tests/fixtures/event_snapshots/`` is the golden snapshot set that
+# ``script/verify_event_bytes.py`` and ``script/check_snapshot_diff.py`` both
+# consume, so any drift between the Rust contracts, the TypeScript SDK, and
+# the GraphQL/SQL schemas is caught here.
+
+#: Every event fixture in the golden corpus, mapped to the payload fields that
+#: must be treated as security-relevant by ``SECURITY_FIELDS``.
+EVENT_FIXTURE_PAYLOAD_FIELDS = {
+    'stream_created.json': ['stream_id', 'sender', 'recipient', 'deposit_amount'],
+    'stream_cloned.json': ['stream_id', 'recipient', 'deposit_amount'],
+    'stream_withdrawn.json': ['stream_id', 'recipient', 'amount'],
+    'stream_cancelled.json': ['stream_id', 'sender', 'recipient', 'refund_amount'],
+    'keeper_cancelled.json': ['stream_id', 'keeper', 'keeper_fee', 'recipient_amount'],
+    'stream_completed.json': ['stream_id', 'recipient', 'final_amount'],
+    'stream_paused.json': ['stream_id', 'sender'],
+    'stream_resumed.json': ['stream_id', 'sender'],
+}
+
 
 class TestRealEventFixtures:
-    """Security-relevance checks against real KeeperCancelled/StreamCloned shapes."""
+    """Security-relevance checks against the ABI-aligned event snapshot corpus."""
+
+    @pytest.mark.parametrize("fixture_name", sorted(EVENT_FIXTURE_PAYLOAD_FIELDS))
+    def test_fixture_loads_and_has_events(self, fixture_name):
+        """Every golden fixture parses and carries at least one event entry."""
+        snap = _load_fixture(fixture_name)
+        assert isinstance(snap, dict)
+        assert isinstance(snap.get('events'), list) and snap['events']
+        assert isinstance(snap['events'][0].get('data'), dict)
+
+    @pytest.mark.parametrize(
+        "fixture_name,field",
+        [
+            (fixture_name, field)
+            for fixture_name, fields in sorted(EVENT_FIXTURE_PAYLOAD_FIELDS.items())
+            for field in fields
+        ],
+    )
+    def test_payload_field_change_is_flagged(self, fixture_name, field):
+        """Mutating any ABI payload field produces a security-relevant diff."""
+        old = _load_fixture(fixture_name)
+        new = copy.deepcopy(old)
+        original = new['events'][0]['data'][field]
+        if isinstance(original, str):
+            new['events'][0]['data'][field] = original + 'X'
+        elif isinstance(original, bool):
+            new['events'][0]['data'][field] = not original
+        else:
+            new['events'][0]['data'][field] = original + 1
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert f'events[0].data.{field}' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    @pytest.mark.parametrize("fixture_name", sorted(EVENT_FIXTURE_PAYLOAD_FIELDS))
+    def test_topic_change_is_flagged(self, fixture_name):
+        """Topic layout is part of the frozen ABI and must gate on change."""
+        old = _load_fixture(fixture_name)
+        new = copy.deepcopy(old)
+        new['events'][0]['topic'][0] = 'DIFFERENT_TOPIC'
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].topic[0]' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    @pytest.mark.parametrize("fixture_name", sorted(EVENT_FIXTURE_PAYLOAD_FIELDS))
+    def test_identical_fixture_produces_no_diffs(self, fixture_name):
+        snap = _load_fixture(fixture_name)
+        assert check_snapshot_diff.get_diff_paths(snap, copy.deepcopy(snap)) == []
 
     def test_keeper_cancelled_keeper_fee_change_is_flagged(self):
         old = _load_fixture('keeper_cancelled.json')
@@ -665,6 +771,34 @@ class TestRealEventFixtures:
         diffs = check_snapshot_diff.get_diff_paths(old, new)
         assert diffs == ['ledger_sequence']
         assert not any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_event_list_length_change_is_flagged(self):
+        """Adding/removing an event entry changes the list length and must gate."""
+        old = _load_fixture('stream_created.json')
+        new = copy.deepcopy(old)
+        new['events'].append(copy.deepcopy(old['events'][0]))
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_event_list_removal_is_flagged(self):
+        old = _load_fixture('stream_created.json')
+        new = copy.deepcopy(old)
+        new['events'] = []
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
+
+    def test_topic_list_length_change_is_flagged(self):
+        old = _load_fixture('stream_created.json')
+        new = copy.deepcopy(old)
+        new['events'][0]['topic'] = new['events'][0]['topic'][:1]
+
+        diffs = check_snapshot_diff.get_diff_paths(old, new)
+        assert 'events[0].topic' in diffs
+        assert any(check_snapshot_diff.is_security_relevant(d) for d in diffs)
 
 
 # ===========================================================================
@@ -758,4 +892,60 @@ class TestMainEndToEndRealGitRepo:
                 check_snapshot_diff.main()
 
         assert exc.value.code == 0
+
+    def test_malformed_new_fixture_across_real_commits_exits_1(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """
+        A real commit that corrupts a golden fixture's JSON must still be
+        caught: the malformed new content falls back to ``{}``, so the
+        security-relevant ``events`` key disappears and the gate fires.
+        """
+        repo = str(tmp_path)
+        self._init_repo(repo)
+
+        baseline = _load_fixture('stream_withdrawn.json')
+        base_sha = _commit_snapshot(repo, self.SNAPSHOT_REL_PATH, baseline)
+
+        full_path = os.path.join(repo, self.SNAPSHOT_REL_PATH)
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write('{ this is not valid json')
+        _run_git(['add', '-A'], cwd=repo)
+        _run_git(['commit', '-m', 'snapshot: corrupt'], cwd=repo)
+        head_sha = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=repo
+        ).decode('utf-8').strip()
+
+        monkeypatch.chdir(repo)
+        with patch('sys.argv', ['check_snapshot_diff.py', '--base', base_sha, '--head', head_sha]):
+            with pytest.raises(SystemExit) as exc:
+                check_snapshot_diff.main()
+
+        assert exc.value.code == 1
+        assert 'Security-relevant fields changed' in capsys.readouterr().out
+
+    def test_deleted_fixture_across_real_commits_exits_1(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Deleting a golden fixture removes its security-relevant keys → exit 1."""
+        repo = str(tmp_path)
+        self._init_repo(repo)
+
+        baseline = _load_fixture('stream_cancelled.json')
+        base_sha = _commit_snapshot(repo, self.SNAPSHOT_REL_PATH, baseline)
+
+        os.remove(os.path.join(repo, self.SNAPSHOT_REL_PATH))
+        _run_git(['add', '-A'], cwd=repo)
+        _run_git(['commit', '-m', 'snapshot: delete'], cwd=repo)
+        head_sha = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], cwd=repo
+        ).decode('utf-8').strip()
+
+        monkeypatch.chdir(repo)
+        with patch('sys.argv', ['check_snapshot_diff.py', '--base', base_sha, '--head', head_sha]):
+            with pytest.raises(SystemExit) as exc:
+                check_snapshot_diff.main()
+
+        assert exc.value.code == 1
+        assert 'Security-relevant fields changed' in capsys.readouterr().out
 

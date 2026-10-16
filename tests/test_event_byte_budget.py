@@ -17,11 +17,14 @@ that silently would be exactly the kind of drift these tests exist to catch.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
+
+_SNAPSHOT_DIR = _ROOT / "tests" / "fixtures" / "event_snapshots"
 
 
 def _load(name: str):
@@ -101,6 +104,54 @@ class TestIndependentCrossCheck:
         )
         assert result.returncode == 0, result.stderr
         assert "MATCHES evsize.py (260)" in result.stdout
+
+    def test_cross_check_covers_every_event(self):
+        """The independent verifier must exercise all code paths in
+        event-byte-budget.py, not just `withdrawn`."""
+        result = subprocess.run(
+            [sys.executable, str(_ROOT / "script" / "verify_event_bytes.py")],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        for name in SIZES:
+            assert name in result.stdout, f"verify_event_bytes.py skipped {name}"
+
+
+class TestGoldenSnapshots:
+    def test_snapshot_fixtures_exist(self):
+        assert _SNAPSHOT_DIR.is_dir(), "missing tests/fixtures/event_snapshots/"
+        files = sorted(_SNAPSHOT_DIR.glob("*.json"))
+        assert files, "no golden event snapshot fixtures found"
+
+    def test_snapshots_match_event_definitions(self):
+        """Every golden snapshot must describe an event that
+        event-byte-budget.py actually models, with matching topic/payload
+        fields. This is the schema-drift tripwire."""
+        for path in sorted(_SNAPSHOT_DIR.glob("*.json")):
+            snap = json.loads(path.read_text())
+            name = snap["event"]
+            assert name in SIZES, f"{path.name}: unknown event {name!r}"
+            assert snap["total"] == SIZES[name]["total"], (
+                f"{path.name}: total drifted from the model"
+            )
+            assert snap["data"] == SIZES[name]["data"], (
+                f"{path.name}: data payload size drifted from the model"
+            )
+            assert snap["topics"] == SIZES[name]["topics"], (
+                f"{path.name}: topic layout drifted from the model"
+            )
+            assert snap["topics"] > 0
+            assert snap["data"] >= 0
+
+    def test_every_event_has_a_snapshot(self):
+        snapshotted = {
+            json.loads(p.read_text())["event"]
+            for p in _SNAPSHOT_DIR.glob("*.json")
+        }
+        assert snapshotted == set(SIZES), (
+            "golden snapshots must cover every modelled event"
+        )
 
 
 class TestScriptRuns:

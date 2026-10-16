@@ -78,6 +78,38 @@ use soroban_sdk::{contractevent, Address, Env};
 
 use crate::types::{Stream, StreamStatus};
 
+/// Canonical inventory of every event's `topic[0]` namespace symbol, in the
+/// exact `snake_case` form the `#[contractevent]` macro derives from the struct
+/// name.
+///
+/// This is the frozen ABI surface for event routing. It exists so that the
+/// off-chain parity tooling (`script/event-byte-budget.py`,
+/// `script/verify_event_bytes.py`, `script/check_snapshot_diff.py`) and the
+/// golden snapshot fixtures under `tests/fixtures/event_snapshots/` can assert
+/// against a single source of truth instead of re-deriving names from the
+/// generated spec.
+///
+/// **Invariant (issue #1585):** every entry is unique. Two structs producing
+/// the same `topic[0]` would make two distinct event kinds indistinguishable to
+/// an indexer filtering by topic. The uniqueness of this list is asserted by
+/// `test::events::test_all_event_topic_names_are_unique`.
+///
+/// **Versioning:** appending an entry is additive. Renaming or removing an
+/// entry is a breaking change and requires a `V2` struct alongside the old one
+/// for the migration window.
+pub const EVENT_TOPIC_NAMES: [&str; 10] = [
+    "stream_created",
+    "withdrawn",
+    "cancelled",
+    "paused",
+    "resumed",
+    "topped_up",
+    "recipient_transferred",
+    "delegate_granted",
+    "delegate_revoked",
+    "ttl_extended",
+];
+
 /// A new stream was created. Carries the complete initial state — this is the
 /// event an indexer builds its sender/recipient mapping from.
 #[contractevent]
@@ -222,6 +254,10 @@ pub struct DelegateRevoked {
 }
 
 /// A stream entry's TTL was topped up. Lets a keeper confirm its sweep landed.
+///
+/// `stream_id` is a topic so a keeper can filter its own sweeps server-side,
+/// matching the routing rule that every event carries `stream_id` as `topic[0]`
+/// or `topic[1]`.
 #[contractevent]
 pub struct TtlExtended {
     #[topic]

@@ -75,6 +75,106 @@ def address(contract=False):    # SCV_ADDRESS -> SCAddress::Account(Hash[32])
     return 4 + 4 + 32 + (4 if contract else 0)
 
 
+# --- Frozen schema constants (must match docs/ABI.md) -------------------
+#
+# These names are the contract between the on-chain events and every
+# off-chain consumer (indexers, TypeScript SDK, GraphQL/SQL schemas).
+# They are frozen: changing one is a schema-drift event and must be
+# accompanied by a matching change in docs/ABI.md and the fixtures under
+# tests/fixtures/event_snapshots/.
+
+# The ten events emitted by contracts/stream/src/events.rs, in declaration
+# order. `sizes()` and the snapshot tooling iterate this list.
+EVENT_NAMES = (
+    "stream_created",
+    "withdrawn",
+    "cancelled",
+    "paused",
+    "resumed",
+    "topped_up",
+    "recipient_transferred",
+    "delegate_granted",
+    "delegate_revoked",
+    "ttl_extended",
+)
+
+# Topic layout per event: the ordered list of topic element kinds. The
+# first element is always the stream id; the rest are addresses. This is
+# the frozen topic schema indexers key on.
+TOPIC_LAYOUT = {
+    "stream_created": ("stream_id", "address", "address"),
+    "withdrawn": ("stream_id", "address"),
+    "cancelled": ("stream_id", "address", "address"),
+    "paused": ("stream_id", "address"),
+    "resumed": ("stream_id", "address"),
+    "topped_up": ("stream_id", "address"),
+    "recipient_transferred": ("stream_id", "address", "address"),
+    "delegate_granted": ("stream_id", "address", "address"),
+    "delegate_revoked": ("stream_id", "address", "address"),
+    "ttl_extended": ("stream_id",),
+}
+
+# Data payload schema per event: ordered (field name, ScVal kind) pairs.
+# The ScVal kind is the tag used by the size model above.
+DATA_LAYOUT = {
+    "stream_created": (
+        ("token", "address"),
+        ("deposited", "i128"),
+        ("start_time", "u64"),
+        ("end_time", "u64"),
+        ("cliff_time", "u64"),
+        ("cancellable", "bool"),
+        ("pausable", "bool"),
+        ("transferable", "bool"),
+    ),
+    "withdrawn": (
+        ("amount", "i128"),
+        ("withdrawn", "i128"),
+        ("deposited", "i128"),
+        ("status", "u32"),
+    ),
+    "cancelled": (
+        ("refunded", "i128"),
+        ("vested", "i128"),
+        ("withdrawn", "i128"),
+        ("end_time", "u64"),
+    ),
+    "paused": (
+        ("paused_at", "u64"),
+        ("paused_total", "u64"),
+    ),
+    "resumed": (
+        ("paused_duration", "u64"),
+        ("paused_total", "u64"),
+    ),
+    "topped_up": (
+        ("amount", "i128"),
+        ("deposited", "i128"),
+        ("end_time", "u64"),
+    ),
+    "recipient_transferred": (),
+    "delegate_granted": (
+        ("ops", "u32"),
+        ("expires_at", "option_u64"),
+    ),
+    "delegate_revoked": (),
+    "ttl_extended": (
+        ("extended_to_ledgers", "u32"),
+    ),
+}
+
+# ScVal kind -> body size function. Used to recompute payload sizes from
+# the frozen schema rather than from hand-written literals.
+_KIND_SIZERS = {
+    "u32": u32,
+    "u64": u64,
+    "i128": i128,
+    "bool": boolean,
+    "address": address,
+    "option_u64": option_u64,
+}
+
+
 def option_u64(_v):             # Option<u64> encodes as a Vec of 0 or 1 elements
     # SCV_VEC discriminant(4) + pointer(4) + count(4) + one u64
     return 4 + 4 + 4 + u64(0)
@@ -99,14 +199,6 @@ ID = 1_000             # a mid-range stream id
 AMOUNT = 1_000_000_000_000   # 1e12, a large but ordinary token amount
 
 
-def _ev(name, topic_elems, pairs):
-    return {
-        "name": name,
-        "topics": topics(topic_elems),
-        "data": smap(pairs),
-    }
-
-
 def _t_stream_id():
     return u64(ID)
 
@@ -115,61 +207,42 @@ def _t_addr():
     return address()
 
 
-EVENTS = [
-    _ev("stream_created",
-        [_t_stream_id(), _t_addr(), _t_addr()],
-        [(sym("token"), address()),
-         (sym("deposited"), i128(AMOUNT)),
-         (sym("start_time"), u64(TS)),
-         (sym("end_time"), u64(TS)),
-         (sym("cliff_time"), u64(TS)),
-         (sym("cancellable"), boolean(True)),
-         (sym("pausable"), boolean(True)),
-         (sym("transferable"), boolean(True))]),
+def _topic_elems(name):
+    """Build the topic element sizes from the frozen TOPIC_LAYOUT."""
+    elems = []
+    for kind in TOPIC_LAYOUT[name]:
+        if kind == "stream_id":
+            elems.append(_t_stream_id())
+        elif kind == "address":
+            elems.append(_t_addr())
+        else:  # pragma: no cover - guarded by schema validation
+            raise ValueError(f"unknown topic kind {kind!r} for {name}")
+    return elems
 
-    _ev("withdrawn",
-        [_t_stream_id(), address()],
-        [(sym("amount"), i128(AMOUNT)),
-         (sym("withdrawn"), i128(AMOUNT)),
-         (sym("deposited"), i128(AMOUNT)),
-         (sym("status"), u32(0))]),
 
-    _ev("cancelled",
-        [_t_stream_id(), _t_addr(), _t_addr()],
-        [(sym("refunded"), i128(AMOUNT)),
-         (sym("vested"), i128(AMOUNT)),
-         (sym("withdrawn"), i128(AMOUNT)),
-         (sym("end_time"), u64(TS))]),
+def _data_pairs(name):
+    """Build the data payload (key, value) sizes from DATA_LAYOUT."""
+    pairs = []
+    for field, kind in DATA_LAYOUT[name]:
+        sizer = _KIND_SIZERS[kind]
+        pairs.append((sym(field), sizer(0)))
+    return pairs
 
-    _ev("paused",
-        [_t_stream_id(), _t_addr()],
-        [(sym("paused_at"), u64(TS)), (sym("paused_total"), u64(TS))]),
 
-    _ev("resumed",
-        [_t_stream_id(), _t_addr()],
-        [(sym("paused_duration"), u64(TS)), (sym("paused_total"), u64(TS))]),
+def _ev(name):
+    return {
+        "name": name,
+        "topics": topics(_topic_elems(name)),
+        "data": smap(_data_pairs(name)),
+    }
 
-    _ev("topped_up",
-        [_t_stream_id(), _t_addr()],
-        [(sym("amount"), i128(AMOUNT)),
-         (sym("deposited"), i128(AMOUNT)),
-         (sym("end_time"), u64(TS))]),
 
-    _ev("recipient_transferred",
-        [_t_stream_id(), _t_addr(), _t_addr()], []),
+# EVENTS is derived from the frozen schema tables above, so the byte model
+# cannot drift from the documented ABI without this module failing to build.
+EVENTS = [_ev(name) for name in EVENT_NAMES]
 
-    _ev("delegate_granted",
-        [_t_stream_id(), _t_addr(), _t_addr()],
-        [(sym("ops"), u32(0)),
-         (sym("expires_at"), option_u64(TS))]),
-
-    _ev("delegate_revoked",
-        [_t_stream_id(), _t_addr(), _t_addr()], []),
-
-    _ev("ttl_extended",
-        [_t_stream_id()],
-        [(sym("extended_to_ledgers"), u32(0))]),
-]
+# Sanity: the derived event list must cover exactly the frozen names.
+assert [e["name"] for e in EVENTS] == list(EVENT_NAMES)
 
 # ContractEvent framing, per the Soroban spec:
 #   ExtentionPoint ext  -> 4 bytes (discriminant, always 0)
@@ -180,12 +253,44 @@ MAX_BATCH_SIZE = 16
 
 
 def sizes():
+    """Deterministic, 4-byte-aligned byte accounting for every event.
+
+    Every component (topics, data, total) is a multiple of 4 because each
+    ScVal body is padded to 4 bytes and the framing is 4-byte aligned.
+    """
+    rows = []
+    for e in EVENTS:
+        total = FRAME + e["topics"] + e["data"]
+        assert e["topics"] % 4 == 0, f"{e['name']} topics not 4-byte aligned"
+        assert e["data"] % 4 == 0, f"{e['name']} data not 4-byte aligned"
+        assert total % 4 == 0, f"{e['name']} total not 4-byte aligned"
+        rows.append({
+            "name": e["name"],
+            "topics": e["topics"],
+            "data": e["data"],
+            "total": total,
+        })
+    return rows
+
+
+def schema():
+    """Return the frozen schema for every event, for snapshot tooling.
+
+    The shape is stable and JSON-serialisable so that
+    `script/verify_event_bytes.py` and `script/check_snapshot_diff.py` can
+    compare it against the golden fixtures in
+    tests/fixtures/event_snapshots/.
+    """
     return [
-        {"name": e["name"],
-         "topics": e["topics"],
-         "data": e["data"],
-         "total": FRAME + e["topics"] + e["data"]}
-        for e in EVENTS
+        {
+            "name": name,
+            "topics": list(TOPIC_LAYOUT[name]),
+            "data": [
+                {"name": field, "type": kind}
+                for field, kind in DATA_LAYOUT[name]
+            ],
+        }
+        for name in EVENT_NAMES
     ]
 
 
@@ -198,6 +303,11 @@ if __name__ == "__main__":
     w = next(r["total"] for r in rows if r["name"] == "withdrawn")
     print(f"\nwithdrawn = {w} bytes; issue requires < 256 -> "
           f"{'PASS' if w < 256 else 'FAIL'} ({256 - w} spare)")
+
+    # Schema coverage: every frozen event must be accounted for exactly once.
+    assert len(rows) == len(EVENT_NAMES), "event count drifted from schema"
+    assert {r["name"] for r in rows} == set(EVENT_NAMES), \
+        "event names drifted from schema"
 
     worst = max(rows, key=lambda r: r["total"])
     print(f"\nlargest single event: {worst['name']} at {worst['total']} bytes")

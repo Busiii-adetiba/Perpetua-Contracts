@@ -42,6 +42,10 @@ type Stream {
   ttlExtendedAt:    LedgerSeq!      # last TtlExtended seen
 }
 
+# Event payload schemas. Field order and types are frozen against
+# contracts/stream/src/events.rs and docs/ABI.md; topic[0] is the snake_case
+# struct name and stream_id is always topic[1]. Trailing fields may be added
+# additively, but existing names/types/order must never change.
 type StreamCreatedEvent { streamId: BigInt!, sender: Address!, recipient: Address!, token: Address!, deposited: BigInt!, startTime: BigInt!, endTime: BigInt!, cliffTime: BigInt!, cancellable: Boolean!, pausable: Boolean!, transferable: Boolean!, ledger: LedgerSeq! }
 type WithdrawnEvent   { streamId: BigInt!, recipient: Address!, amount: BigInt!, withdrawn: BigInt!, deposited: BigInt!, status: StreamStatus!, ledger: LedgerSeq! }
 type CancelledEvent   { streamId: BigInt!, sender: Address!, recipient: Address!, refunded: BigInt!, vested: BigInt!, withdrawn: BigInt!, endTime: BigInt!, ledger: LedgerSeq! }
@@ -85,6 +89,8 @@ union Event =
   | DelegateRevokedEvent
   | TtlExtendedEvent
 
+# Exactly the ten on-chain event names, in the order declared by events.rs.
+# Values are the snake_case topic[0] strings emitted by the contract.
 enum EventType {
   stream_created
   withdrawn
