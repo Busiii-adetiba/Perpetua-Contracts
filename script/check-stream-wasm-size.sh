@@ -5,6 +5,7 @@ budget_file="${1:-contracts/stream/wasm-size-budget.env}"
 
 if [ ! -f "$budget_file" ]; then
   echo "missing wasm size budget file: $budget_file" >&2
+  echo "expected a budget env file (e.g. contracts/stream/wasm-size-budget.env) defining PACKAGE, TARGET, ARTIFACT, BUILD_COMMAND, BASELINE_BYTES and MAX_BYTES." >&2
   exit 1
 fi
 

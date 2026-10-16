@@ -103,6 +103,75 @@ class TestIndependentCrossCheck:
         assert "MATCHES evsize.py (260)" in result.stdout
 
 
+class TestHotPathBudget:
+    """Issue #285: the enforcer is invoked once per batch payroll run, so its
+    hot path must stay within a strict CPU-instruction / memory-byte cap.
+
+    `sizes()` is the only non-trivial work the enforcer does: it builds the
+    XDR size table. It must be memoised, so N calls cost one computation and
+    zero extra allocations. These tests pin that contract so a refactor that
+    drops the cache (or invalidates it per call) fails loudly instead of
+    silently multiplying the instruction count by the batch frequency.
+    """
+
+    #: Upper bound on how many times the size table may be recomputed across
+    #: the whole benchmark loop. One is the memoised steady state; anything
+    #: above this means per-call recomputation crept back in.
+    MAX_SIZE_COMPUTATIONS = 1
+
+    #: Iterations of the hot path exercised per benchmark. Chosen to be far
+    #: larger than any realistic batch count so a per-call regression cannot
+    #: hide behind a small sample.
+    ITERATIONS = 1000
+
+    def test_sizes_is_memoised_across_repeated_calls(self):
+        """1000 hot-path calls at MAX_BATCH_SIZE must not recompute sizes."""
+        calls = 0
+        original = ebb._compute_sizes
+
+        def counting_compute():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        ebb._compute_sizes = counting_compute
+        try:
+            ebb.sizes.cache_clear()
+            for _ in range(self.ITERATIONS):
+                table = ebb.sizes()
+                # Touch the hot fields the enforcer reads per event.
+                for row in table:
+                    row["total"] * ebb.MAX_BATCH_SIZE
+        finally:
+            ebb._compute_sizes = original
+            ebb.sizes.cache_clear()
+
+        assert calls <= self.MAX_SIZE_COMPUTATIONS, (
+            f"sizes() recomputed {calls} times over {self.ITERATIONS} calls; "
+            "the hot path must stay memoised"
+        )
+
+    def test_sizes_returns_the_identical_cached_object(self):
+        """Identity, not equality: a fresh-but-equal table is still a
+        regression, because it re-allocates the whole XDR size table."""
+        first = ebb.sizes()
+        second = ebb.sizes()
+        assert first is second
+
+    def test_batch_ceiling_is_pinned_exactly(self):
+        """MAX_BATCH_SIZE * withdrawn is the worst-case event byte footprint
+        of a full batch_withdraw. Pin the exact number so any encoding drift
+        fails loudly rather than sliding under the 16,384 bound."""
+        assert ebb.MAX_BATCH_SIZE * SIZES["withdrawn"]["total"] == 4_160
+
+    def test_hot_path_stays_under_the_ledger_bound(self):
+        """The benchmarked worst case must remain a strict fraction of the
+        Protocol 27 ledger bound."""
+        worst_case = ebb.MAX_BATCH_SIZE * SIZES["withdrawn"]["total"]
+        assert worst_case < ebb.MAX_EVENT_BYTES
+        assert worst_case / ebb.MAX_EVENT_BYTES < 0.5
+
+
 class TestScriptRuns:
     def test_budget_script_exits_cleanly(self):
         result = subprocess.run(

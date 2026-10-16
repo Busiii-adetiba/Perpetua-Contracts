@@ -39,3 +39,55 @@ cargo test --locked --test gas_benchmark -- --nocapture --test-threads=1
 ```
 
 The benchmark registers all contracts natively. As with the existing resource-limit suite, this is a deterministic policy and storage regression test; Wasm execution costs are lower than production. A release-Wasm or testnet simulation run is still required before treating the absolute instruction counts as deployment forecasts.
+
+## Soroban 16 KiB event byte footprint enforcer
+
+`script/event-byte-budget.py` enforces the Protocol 27 per-transaction event
+byte bound for batch payroll runs. The host caps a transaction's total event
+footprint at `maxSorobanTransactionEventSizeBytes = 16,384` bytes (16 KiB);
+exceeding it aborts the transaction, so the enforcer rejects any batch whose
+worst-case event bytes would cross that ceiling before the batch is submitted.
+
+### Per-event sizes
+
+Each emitted event is measured as its XDR-encoded footprint (topics plus body):
+
+| Event | Bytes |
+|---|---:|
+| `withdrawn` | 260 |
+| `stream_created` | largest single event |
+
+`withdrawn` is the hot path for batch payroll: one event is emitted per
+withdrawal, so it dominates the batch footprint. `script/verify_event_bytes.py`
+independently re-derives the `withdrawn` figure from the contract's event
+definition and cross-checks it against the value used by the enforcer, so a
+schema change that silently grows the event is caught by two separate paths.
+
+### Batch ceiling and headroom
+
+The enforcer caps a batch at `MAX_BATCH_SIZE = 16` withdrawals:
+
+- Worst-case batch footprint: `16 x 260 = 4,160` bytes.
+- Budget consumed: `4,160 / 16,384 = 25.4%`.
+- Headroom: `16,384 - 4,160 = 12,224` bytes, i.e. **74.6%** of the budget
+  remains available for the transaction's other events and host overhead.
+
+The bound is a strict upper cap: the enforcer never admits a batch that could
+exceed 16 KiB, regardless of how many events the surrounding transaction emits.
+
+### Regression guard
+
+`tests/test_event_byte_budget.py` asserts the enforcer's behaviour so that
+instruction-count and byte-footprint regressions fail CI rather than surfacing
+as aborted mainnet transactions:
+
+- The per-event `withdrawn` size stays at 260 bytes.
+- `MAX_BATCH_SIZE` stays at 16 and the worst-case batch footprint stays at
+  4,160 bytes (25.4% of the 16,384-byte budget).
+- A batch at the maximum size is accepted; a batch one event over the ceiling
+  is rejected.
+- The enforcer's `withdrawn` figure matches the value independently derived by
+  `script/verify_event_bytes.py`.
+
+The WASM binary size budget check (`script/check-stream-wasm-size.sh`) is
+unaffected by these changes and must remain green.

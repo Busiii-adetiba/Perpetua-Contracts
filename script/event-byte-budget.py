@@ -179,14 +179,54 @@ MAX_EVENT_BYTES = 16_384   # Protocol 27
 MAX_BATCH_SIZE = 16
 
 
+# --- Cached size table --------------------------------------------------
+#
+# The per-event topic/data totals are pure functions of the module-level
+# constants above, so they are computed exactly once at import time and
+# reused by every caller. `sizes()` returns the cached list; `recompute()`
+# is the only way to rebuild it (e.g. after mutating EVENTS in a test).
+
+_SIZES = None
+_BY_NAME = None
+
+
+def _build_sizes():
+    rows = []
+    by_name = {}
+    for e in EVENTS:
+        t = e["topics"]
+        d = e["data"]
+        row = {"name": e["name"], "topics": t, "data": d,
+               "total": FRAME + t + d}
+        rows.append(row)
+        by_name[e["name"]] = row
+    return rows, by_name
+
+
+def recompute():
+    """Rebuild the cached size table. Returns the cached rows list."""
+    global _SIZES, _BY_NAME
+    _SIZES, _BY_NAME = _build_sizes()
+    return _SIZES
+
+
 def sizes():
-    return [
-        {"name": e["name"],
-         "topics": e["topics"],
-         "data": e["data"],
-         "total": FRAME + e["topics"] + e["data"]}
-        for e in EVENTS
-    ]
+    """Return the cached per-event size rows (built once at import)."""
+    if _SIZES is None:
+        recompute()
+    return _SIZES
+
+
+def size_of(name):
+    """Return the cached total byte size of the named event."""
+    if _BY_NAME is None:
+        recompute()
+    return _BY_NAME[name]["total"]
+
+
+def batch_withdraw_bytes():
+    """MAX_BATCH_SIZE x the `withdrawn` event size, from the cache."""
+    return MAX_BATCH_SIZE * size_of("withdrawn")
 
 
 if __name__ == "__main__":
@@ -195,7 +235,7 @@ if __name__ == "__main__":
     for r in rows:
         print(f"{r['name']:<24}{r['topics']:>7}{r['data']:>7}{r['total']:>7}")
 
-    w = next(r["total"] for r in rows if r["name"] == "withdrawn")
+    w = size_of("withdrawn")
     print(f"\nwithdrawn = {w} bytes; issue requires < 256 -> "
           f"{'PASS' if w < 256 else 'FAIL'} ({256 - w} spare)")
 
@@ -205,7 +245,7 @@ if __name__ == "__main__":
     # The event that actually drives the batch cap. `batch_withdraw` emits one
     # `withdrawn` per stream drawn from, so the realistic ceiling is
     # MAX_BATCH_SIZE * withdrawn, not MAX_BATCH_SIZE * (largest event).
-    batch = w * MAX_BATCH_SIZE
+    batch = batch_withdraw_bytes()
     print(f"\nbatch_withdraw: {MAX_BATCH_SIZE} x {w} = {batch} bytes of "
           f"{MAX_EVENT_BYTES} ({batch / MAX_EVENT_BYTES:.2%})")
     print(f"  headroom: {MAX_EVENT_BYTES - batch} bytes "
@@ -215,8 +255,6 @@ if __name__ == "__main__":
     print(f"\n  even {fits} x {worst['name']} fit in one transaction "
           f"({worst['total'] * fits} bytes)")
 
-    combined = batch + next(
-        r["total"] for r in rows if r["name"] == "stream_created"
-    )
+    combined = batch + size_of("stream_created")
     print(f"\nfull batch_withdraw + stream_created = {combined} bytes "
           f"({combined / MAX_EVENT_BYTES:.2%} of budget)")

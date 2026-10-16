@@ -1,6 +1,12 @@
 """Independent hand-calculation of the `withdrawn` event, written from the
 stellar-xdr definitions, to cross-check evsize.py. Deliberately does NOT
 import or reuse anything from that script.
+
+Independence guarantee: this module must never import
+``event-byte-budget`` (or any of its exported names/constants). All sizes
+below are derived solely from the XDR union/struct layouts in
+Stellar-contract.x, so a regression in the budget model cannot mask itself
+by being mirrored here.
 """
 # From Stellar-contract.x:
 #   union SCVal switch (SCValType type)
@@ -43,14 +49,28 @@ data += entry(sym("withdrawn"), I128)
 data += entry(sym("deposited"), I128)
 data += entry(sym("status"), U32)
 
-total = FRAME + topics + data
-print(f"FRAME  = {FRAME}")
-print(f"topics = {topics}")
-print(f"data   = {data}")
-print(f"total  = {total}")
-print()
-print(f"sym sizes: amount={sym('amount')} withdrawn={sym('withdrawn')} "
-      f"deposited={sym('deposited')} status={sym('status')}")
-print(f"val sizes: i128={I128} u32={U32} u64={U64} addr={ADDR}")
-assert total == 260, f"expected 260, got {total}"
-print("\nMATCHES evsize.py (260)")
+EXPECTED_TOTAL = 260
+
+
+def compute_total():
+    """Recompute the `withdrawn` event footprint from scratch."""
+    return FRAME + topics + data
+
+
+def main():
+    total = compute_total()
+    print(f"FRAME  = {FRAME}")
+    print(f"topics = {topics}")
+    print(f"data   = {data}")
+    print(f"total  = {total}")
+    print()
+    print(f"sym sizes: amount={sym('amount')} withdrawn={sym('withdrawn')} "
+          f"deposited={sym('deposited')} status={sym('status')}")
+    print(f"val sizes: i128={I128} u32={U32} u64={U64} addr={ADDR}")
+    assert total == EXPECTED_TOTAL, f"expected {EXPECTED_TOTAL}, got {total}"
+    print(f"\nMATCHES evsize.py ({EXPECTED_TOTAL})")
+    return total
+
+
+if __name__ == "__main__":
+    main()
